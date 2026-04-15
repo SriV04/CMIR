@@ -1,0 +1,77 @@
+framework: da4ml    # or hls4ml, or custom
+
+kernels:
+  da4ml_adder_graph:
+    description: "Constant-coefficient multiply via shift-add tree (da4ml)"
+    supported_ops: [cmvm]
+    parameters:
+      - input_bw: {type: int, range: [1, 16]}
+      - output_bw: {type: int, range: [1, 24]}
+      - kernel_shape: {type: shape}
+    instances: unlimited    # fully unrolled = one per operation
+    latency_model: "ceil(log2(nonzero_weights)) pipeline stages"
+    cost_model:
+      luts: "from da4ml synthesis estimate"
+      dsps: 0
+      ffs: "pipeline_stages × output_bw"
+
+  fixed_adder:
+    description: "Fixed-point adder"
+    supported_ops: [add, accumulate]
+    parameters:
+      - input_bw: {type: int, range: [1, 24]}
+      - output_bw: {type: int, computed: "input_bw + 1"}
+    instances: unlimited
+    latency: 1    # single cycle for narrow adds
+    cost_model:
+      luts: "output_bw"    # ~1 LUT per bit for addition
+      dsps: 0
+
+  mux_n_to_1:
+    description: "N-to-1 multiplexer for folded input selection"
+    supported_ops: [mux]
+    parameters:
+      - n_inputs: {type: int, range: [2, 128]}
+      - data_bw: {type: int}
+    instances: unlimited
+    latency: 0    # combinational
+    cost_model:
+      luts: "ceil(log2(n_inputs)) × data_bw"
+
+  register_file:
+    description: "Flip-flop based buffer for fold iteration storage"
+    supported_ops: [buffer]
+    parameters:
+      - depth: {type: int}
+      - width: {type: int}
+    instances: unlimited
+    latency: 1    # one cycle read
+    cost_model:
+      ffs: "depth × width"
+      luts: 0
+
+  bram_buffer:
+    description: "Block RAM buffer for large fold iteration storage"
+    supported_ops: [buffer]
+    parameters:
+      - depth: {type: int}
+      - width: {type: int}
+    instances: limited
+    max_instances: 2688    # VU13P BRAM count
+    latency: 2
+    cost_model:
+      bram: "ceil(depth × width / 36864)"    # 36Kb per BRAM
+      luts: 0
+
+  hls4ml_dense:
+    description: "HLS4ML fully-connected layer (uses DSPs)"
+    supported_ops: [cmvm]
+    parameters:
+      - input_bw: {type: int}
+      - weight_bw: {type: int}
+      - kernel_shape: {type: shape}
+    instances: unlimited
+    latency_model: "from hls4ml synthesis estimate"
+    cost_model:
+      dsps: "input_dim × output_dim"
+      luts: "from hls4ml estimate"
