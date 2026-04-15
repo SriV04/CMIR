@@ -1,77 +1,90 @@
-framework: da4ml    # or hls4ml, or custom
+# Sched-IR resource description for the da4ml backend.
+#
+# This file describes WHICH kernels claim WHICH Sched-IR primitives and what
+# constraints must hold for a binding to be legal. The actual cost/latency
+# numbers come from `cost_query` callables resolved in
+# `IR/Sched-IR/kernels.py` — they call into da4ml at runtime
+# (`cmvm.api.solve`, `comb_trace`, etc.) rather than encoding any formula
+# here. Static formulas are reserved for the scheduler-inserted infrastructure
+# kernels (register/bram buffers and muxes), where da4ml has nothing to say.
+
+framework: da4ml
+
+# Parameters that flow into da4ml's adder-cell cost model
+# (cmvm.core.state_opr.cost_add). The defaults below match the Xilinx VU13P
+# (LUT6 carry chains). Override per device.
+fpga:
+  device: VU13P
+  adder_size: -1     # -1 = ideal-adder mode (1 cell per addition); set to 6 for LUT6
+  carry_size: -1     # -1 = ideal latency mode (1 cycle per addition); set to 4 for VU13P CARRY8
 
 kernels:
-  da4ml_adder_graph:
-    description: "Constant-coefficient multiply via shift-add tree (da4ml)"
-    supported_ops: [cmvm]
-    parameters:
-      - input_bw: {type: int, range: [1, 16]}
-      - output_bw: {type: int, range: [1, 24]}
-      - kernel_shape: {type: shape}
-    instances: unlimited    # fully unrolled = one per operation
-    latency_model: "ceil(log2(nonzero_weights)) pipeline stages"
-    cost_model:
-      luts: "from da4ml synthesis estimate"
-      dsps: 0
-      ffs: "pipeline_stages × output_bw"
 
-  fixed_adder:
-    description: "Fixed-point adder"
-    supported_ops: [add, accumulate]
-    parameters:
-      - input_bw: {type: int, range: [1, 24]}
-      - output_bw: {type: int, computed: "input_bw + 1"}
+  # ---- Compute kernels (da4ml-driven cost queries) -------------------- #
+
+  da4ml_dense:
+    supported_ops: [dense]
+    constraints:
+      weight_source: constant
     instances: unlimited
-    latency: 1    # single cycle for narrow adds
-    cost_model:
-      luts: "output_bw"    # ~1 LUT per bit for addition
-      dsps: 0
+    cost_query: da4ml_dense_cost
+    notes: |
+      Calls `da4ml.cmvm.api.solve(kernel, qintervals, adder_size, carry_size)`
+      directly with the constant kernel from the Keras layer. Returns the
+      rolled-up `.cost` (adder-cell count) and `.latency` from the resulting
+      CascadedSolution.
 
-  mux_n_to_1:
-    description: "N-to-1 multiplexer for folded input selection"
-    supported_ops: [mux]
-    parameters:
-      - n_inputs: {type: int, range: [2, 128]}
-      - data_bw: {type: int}
+  da4ml_reduce:
+    supported_ops: [reduce]
     instances: unlimited
-    latency: 0    # combinational
-    cost_model:
-      luts: "ceil(log2(n_inputs)) × data_bw"
+    cost_query: da4ml_reduce_cost
+    notes: |
+      Builds a `FixedVariableArray.from_kif(...)` of the input shape, runs
+      `np.sum / np.amax / np.amin` (per `op_params.mode`), then `comb_trace`
+      → Solution.cost / Solution.latency.
 
-  register_file:
-    description: "Flip-flop based buffer for fold iteration storage"
+  da4ml_elementwise:
+    supported_ops: [elementwise]
+    instances: unlimited
+    cost_query: da4ml_elementwise_cost
+    notes: |
+      Lowers add/sub/mul/max/min through FixedVariable operator overloads
+      (`a + b`, `a * b`, …) on broadcast-aligned FixedVariableArray inputs,
+      then `comb_trace` → cost/latency.
+
+  da4ml_activation:
+    supported_ops: [activation]
+    instances: unlimited
+    cost_query: da4ml_activation_cost
+    notes: |
+      ReLU lowers via `da4ml.trace.ops.relu` over a FixedVariableArray.
+      sigmoid/tanh/softmax fall through to a TODO LUT estimator (not used by
+      JEDI-linear).
+
+  # ---- Scheduler-inserted infrastructure (closed-form cost) ----------- #
+
+  register_buffer:
     supported_ops: [buffer]
-    parameters:
-      - depth: {type: int}
-      - width: {type: int}
+    constraints:
+      max_depth: 64
     instances: unlimited
-    latency: 1    # one cycle read
-    cost_model:
-      ffs: "depth × width"
-      luts: 0
+    cost_query: register_buffer_cost
+    inserted_by: scheduler
+    notes: "FF cost = depth × width_bits, latency = 1 cycle, ii = 1."
 
   bram_buffer:
-    description: "Block RAM buffer for large fold iteration storage"
     supported_ops: [buffer]
-    parameters:
-      - depth: {type: int}
-      - width: {type: int}
+    constraints:
+      min_depth: 64
     instances: limited
-    max_instances: 2688    # VU13P BRAM count
-    latency: 2
-    cost_model:
-      bram: "ceil(depth × width / 36864)"    # 36Kb per BRAM
-      luts: 0
+    max_instances: 2688          # VU13P BRAM count
+    cost_query: bram_buffer_cost
+    inserted_by: scheduler
+    notes: "BRAM = ceil(depth × width_bits / 36864), latency = 2 cycles, ii = 1."
 
-  hls4ml_dense:
-    description: "HLS4ML fully-connected layer (uses DSPs)"
-    supported_ops: [cmvm]
-    parameters:
-      - input_bw: {type: int}
-      - weight_bw: {type: int}
-      - kernel_shape: {type: shape}
+  lut_mux:
+    supported_ops: [mux]
     instances: unlimited
-    latency_model: "from hls4ml synthesis estimate"
-    cost_model:
-      dsps: "input_dim × output_dim"
-      luts: "from hls4ml estimate"
+    cost_query: lut_mux_cost
+    inserted_by: scheduler
+    notes: "LUT cost = ceil(log2(n_inputs)) × width_bits, latency = 0 (combinational)."

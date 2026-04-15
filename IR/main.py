@@ -36,12 +36,14 @@ sys.path.insert(0, str(REPO / "heterograph"))
 def _load_path(name: str, path: Path):
     spec = importlib.util.spec_from_file_location(name, path)
     mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod  # required for dataclasses / introspection helpers
     spec.loader.exec_module(mod)
     return mod
 
 
 nn_ir_builder = _load_path("nn_ir_builder", HERE / "NN-IR" / "builder.py")
 sched_decomp = _load_path("sched_decomposer", HERE / "Sched-IR" / "decomposer.py")
+sched_engine = _load_path("sched_scheduler", HERE / "Sched-IR" / "scheduler.py")
 build_nn_ir = nn_ir_builder.build_nn_ir
 
 
@@ -62,6 +64,17 @@ print(f"[jedi_gnn] nn-ir: {g.num_vx} vertices, {g.num_edges} edges")
 # --------------------------------------------------------------------------- #
 # Sched-IR First pass:
 g_sched = sched_decomp.decompose_nn_to_sched(g)
+print(f"[jedi_gnn] sched-ir (decomposed): {g_sched.num_vx} vertices, {g_sched.num_edges} edges")
+
+# --------------------------------------------------------------------------- #
+# Sched-IR Phase 1 — BIND with real da4ml costs
+g_sched = sched_engine.bind(
+    g_sched,
+    model,
+    HERE / "Sched-IR" / "da4ml-resource.yaml",
+)
+_total_lut = sum((g_sched.pmap[v].get("cost") or {}).get("lut", 0) for v in g_sched.vertices)
+print(f"[jedi_gnn] sched-ir (bound): total kernel LUT = {_total_lut}")
 
 
 # --------------------------------------------------------------------------- #
@@ -222,6 +235,22 @@ def sched_vx_label(g, vx):
         lines.append(f"w={pp.get('width_bits')} d={pp.get('depth')}")
     elif op == "mux":
         lines.append(f"n={pp.get('n_inputs')} w={pp.get('width_bits')}")
+
+    # ---- Phase 1 BIND output: kernel + cost ---- #
+    kt = p.get("kernel_type")
+    if kt is not None:
+        ki = p.get("kernel_instance")
+        lines.append(f"kernel: {kt}#{ki}")
+    cost = p.get("cost") or {}
+    if cost:
+        bits = []
+        if cost.get("lut"):            bits.append(f"lut={cost['lut']}")
+        if cost.get("ff"):             bits.append(f"ff={cost['ff']}")
+        if cost.get("dsp"):            bits.append(f"dsp={cost['dsp']}")
+        if cost.get("bram"):           bits.append(f"bram={cost['bram']}")
+        if cost.get("latency_cycles"): bits.append(f"lat={cost['latency_cycles']}")
+        if bits:
+            lines.append(" ".join(bits))
     return "\n".join(lines)
 
 
