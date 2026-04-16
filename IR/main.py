@@ -44,7 +44,10 @@ def _load_path(name: str, path: Path):
 nn_ir_builder = _load_path("nn_ir_builder", HERE / "NN-IR" / "builder.py")
 sched_decomp = _load_path("sched_decomposer", HERE / "Sched-IR" / "decomposer.py")
 sched_engine = _load_path("sched_scheduler", HERE / "Sched-IR" / "scheduler.py")
+sched_folder = _load_path("sched_folder", HERE / "Sched-IR" / "folder.py")
+sched_p3     = _load_path("sched_p3", HERE / "Sched-IR" / "scheduler_p3.py")
 build_nn_ir = nn_ir_builder.build_nn_ir
+RESOURCE_YAML = HERE / "Sched-IR" / "da4ml-resource.yaml"
 
 
 # --------------------------------------------------------------------------- #
@@ -62,19 +65,42 @@ g = build_nn_ir(model, name="jedi_gnn")
 print(f"[jedi_gnn] nn-ir: {g.num_vx} vertices, {g.num_edges} edges")
 
 # --------------------------------------------------------------------------- #
-# Sched-IR First pass:
-g_sched = sched_decomp.decompose_nn_to_sched(g)
-print(f"[jedi_gnn] sched-ir (decomposed): {g_sched.num_vx} vertices, {g_sched.num_edges} edges")
-
+# Sched-IR — Decompose → BIND → FOLD, repeated for K=1 (baseline) and K=4
+# (hybrid). Each fold factor produces its own scheduled graph; the webview
+# shows them side by side so we can eyeball the area/latency trade.
 # --------------------------------------------------------------------------- #
-# Sched-IR Phase 1 — BIND with real da4ml costs
-g_sched = sched_engine.bind(
-    g_sched,
-    model,
-    HERE / "Sched-IR" / "da4ml-resource.yaml",
-)
-_total_lut = sum((g_sched.pmap[v].get("cost") or {}).get("lut", 0) for v in g_sched.vertices)
-print(f"[jedi_gnn] sched-ir (bound): total kernel LUT = {_total_lut}")
+
+def _build_sched(K: int):
+    g_local = sched_decomp.decompose_nn_to_sched(g)
+    g_local = sched_engine.bind(g_local, model, RESOURCE_YAML)
+    g_local = sched_folder.fold(g_local, factor=K)
+    g_local = sched_p3.schedule(g_local)
+    return g_local
+
+
+def _area_weighted_lut(g_local) -> int:
+    total = 0
+    for v in g_local.vertices:
+        p = g_local.pmap[v]
+        cost = p.get("cost") or {}
+        inst = p.get("physical_instances") or 1
+        total += int(cost.get("lut") or 0) * int(inst)
+    return total
+
+
+g_sched = _build_sched(1)              # baseline
+g_sched_k4 = _build_sched(4)           # hybrid fold
+
+def _summary(label, gx):
+    lut = _area_weighted_lut(gx)
+    ms = gx.pmap.get("makespan", "?")
+    ii = gx.pmap.get("initiation_interval", "?")
+    print(f"[jedi_gnn] {label}: {gx.num_vx} vx / {gx.num_edges} ed, "
+          f"LUT={lut}, makespan={ms} cyc, II={ii}")
+
+
+_summary("sched K=1", g_sched)
+_summary("sched K=4", g_sched_k4)
 
 
 # --------------------------------------------------------------------------- #
@@ -249,8 +275,28 @@ def sched_vx_label(g, vx):
         if cost.get("dsp"):            bits.append(f"dsp={cost['dsp']}")
         if cost.get("bram"):           bits.append(f"bram={cost['bram']}")
         if cost.get("latency_cycles"): bits.append(f"lat={cost['latency_cycles']}")
+        if cost.get("ii", 1) and cost.get("ii") != 1: bits.append(f"ii={cost['ii']}")
         if bits:
             lines.append(" ".join(bits))
+
+    # ---- Phase 2 FOLD output: K, instance count, group id, reduce mode ---- #
+    K = p.get("fold_factor")
+    inst = p.get("physical_instances")
+    fg = p.get("fold_group")
+    if K is not None and (K != 1 or inst not in (None, 1) or fg is not None):
+        line = f"K={K} inst={inst}"
+        if fg is not None:
+            line += f" g{fg}"
+        lines.append(line)
+    rm = p.get("reduce_mode")
+    if rm and rm != "spatial":
+        lines.append(f"reduce: {rm}")
+
+    # ---- Phase 3 SCHEDULE output: timing ---- #
+    ts = p.get("t_start")
+    te = p.get("t_end")
+    if ts is not None and te is not None:
+        lines.append(f"t=[{ts}..{te}]")
     return "\n".join(lines)
 
 
@@ -264,6 +310,9 @@ def sched_edge_label(g, e):
     vol = p.get("volume_bits")
     if vol is not None:
         tag += f"\n{int(vol)} bits"
+    lt = p.get("lifetime")
+    if lt is not None and lt > 0:
+        tag += f"\nbuf={lt} cyc"
     return tag
 
 
@@ -273,17 +322,160 @@ def sched_edge_penwidth(g, e):
     return str(0.6 + 0.6 * math.log1p(vol / 64))
 
 
-g_sched.vstyle["fillcolor"] = lambda g, vx: SCHED_COLORS.get(g.pmap[vx]["op"], "#FFFFFF")
-g_sched.vstyle["shape"] = lambda g, vx: SCHED_SHAPES.get(g.pmap[vx]["op"], "box")
-g_sched.vstyle["style"] = lambda g, vx: "filled"
-g_sched.vstyle["fontcolor"] = lambda g, vx: (
-    "white" if g.pmap[vx]["op"] in ("dense", "reduce", "elementwise", "buffer", "mux") else "black"
-)
-g_sched.vstyle["label"] = sched_vx_label
+def _apply_sched_style(gx):
+    gx.vstyle["fillcolor"] = lambda g, vx: SCHED_COLORS.get(g.pmap[vx]["op"], "#FFFFFF")
+    gx.vstyle["shape"] = lambda g, vx: SCHED_SHAPES.get(g.pmap[vx]["op"], "box")
+    gx.vstyle["style"] = lambda g, vx: "filled"
+    gx.vstyle["fontcolor"] = lambda g, vx: (
+        "white" if g.pmap[vx]["op"] in ("dense", "reduce", "elementwise", "buffer", "mux") else "black"
+    )
+    gx.vstyle["penwidth"] = lambda g, vx: "3" if g.pmap[vx].get("critical_path") else "1"
+    gx.vstyle["color"] = lambda g, vx: "#E53935" if g.pmap[vx].get("critical_path") else "#333333"
+    gx.vstyle["label"] = sched_vx_label
+    gx.estyle["label"] = sched_edge_label
+    gx.estyle["penwidth"] = sched_edge_penwidth
+    gx.estyle["fontsize"] = lambda g, e: "10"
+    gx.estyle["color"] = lambda g, e: "#E53935" if g.pmap[e].get("lifetime", 0) > 0 else "#666666"
 
-g_sched.estyle["label"] = sched_edge_label
-g_sched.estyle["penwidth"] = sched_edge_penwidth
-g_sched.estyle["fontsize"] = lambda g, e: "10"
+
+_apply_sched_style(g_sched)
+_apply_sched_style(g_sched_k4)
+
+
+# --------------------------------------------------------------------------- #
+# Gantt chart wrapper — feeds raw SVG into the WebView
+# --------------------------------------------------------------------------- #
+
+class GanttWrapper:
+    """Thin wrapper so WebView.add_graph can render a Gantt SVG."""
+
+    def __init__(self, g_sched):
+        self._svg = _render_gantt_svg(g_sched)
+        self.style = {}
+
+    def render(self, *, format="svg", pipe=False, **kwargs):
+        return self._svg
+
+
+def _render_gantt_svg(gx):
+    """Generate a cycle-accurate Gantt chart as raw SVG bytes."""
+    makespan = int(gx.pmap.get("makespan") or 1)
+    crit_set = set(gx.pmap.get("critical_path") or [])
+
+    # Collect rows in topological order (source → sink).
+    rows = []
+    for v in gx.vertices:
+        p = gx.pmap[v]
+        rows.append({
+            "vx": v,
+            "name": p.get("nn_layer_name") or "?",
+            "op": p.get("op") or "?",
+            "t_start": int(p.get("t_start") or 0),
+            "t_end": int(p.get("t_end") or 1),
+            "K": int(p.get("fold_factor") or 1),
+            "crit": v in crit_set,
+        })
+
+    # Collect buffer edges (lifetime > 0)
+    buf_edges = []
+    for u, v in gx.edges:
+        ep = gx.pmap[(u, v)]
+        lt = ep.get("lifetime", 0)
+        if lt and lt > 0:
+            buf_edges.append({
+                "src": u, "dst": v,
+                "t_produce": int(ep.get("t_produce", 0)),
+                "t_consume": int(ep.get("t_consume", 0)),
+                "lifetime": int(lt),
+            })
+
+    # Layout constants
+    PX_PER_CYCLE = max(18, min(30, 900 // max(makespan, 1)))
+    ROW_H = 36
+    LABEL_W = 240
+    PAD = 20
+    HEADER_H = 30
+
+    chart_w = makespan * PX_PER_CYCLE
+    total_w = LABEL_W + chart_w + 2 * PAD
+    total_h = HEADER_H + len(rows) * ROW_H + 2 * PAD
+
+    vx_to_row = {r["vx"]: i for i, r in enumerate(rows)}
+
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{total_w}pt" height="{total_h}pt" '
+        f'viewBox="0 0 {total_w} {total_h}" '
+        f'font-family="monospace" font-size="11">',
+        f'<g id="graph0" class="graph" transform="translate(0,0)">',
+        f'<rect width="{total_w}" height="{total_h}" fill="#1e1e1e"/>',
+    ]
+
+    x0 = LABEL_W + PAD
+    y0 = HEADER_H + PAD
+
+    # Cycle grid lines
+    for c in range(0, makespan + 1, max(1, makespan // 20)):
+        x = x0 + c * PX_PER_CYCLE
+        parts.append(f'<line x1="{x}" y1="{y0 - 5}" x2="{x}" y2="{y0 + len(rows) * ROW_H}" '
+                     f'stroke="#444" stroke-width="0.5"/>')
+        parts.append(f'<text x="{x}" y="{y0 - 8}" fill="#aaa" font-size="9" text-anchor="middle">{c}</text>')
+
+    # Rows
+    for i, r in enumerate(rows):
+        y = y0 + i * ROW_H
+        bw = (r["t_end"] - r["t_start"]) * PX_PER_CYCLE
+        bx = x0 + r["t_start"] * PX_PER_CYCLE
+
+        color = SCHED_COLORS.get(r["op"], "#888")
+        border = "#E53935" if r["crit"] else "#555"
+        bw_px = max(bw, 2)
+
+        # Label
+        parts.append(f'<text x="{LABEL_W}" y="{y + ROW_H // 2 + 4}" fill="#ccc" '
+                     f'text-anchor="end" font-size="10">{r["name"]}</text>')
+
+        # Bar
+        parts.append(f'<rect x="{bx}" y="{y + 4}" width="{bw_px}" height="{ROW_H - 8}" '
+                     f'rx="3" fill="{color}" stroke="{border}" stroke-width="{"2" if r["crit"] else "1"}"/>')
+
+        # Timing text inside bar
+        label = f'{r["t_start"]}..{r["t_end"]}'
+        if r["K"] > 1:
+            label += f' K={r["K"]}'
+        if bw_px > 50:
+            parts.append(f'<text x="{bx + bw_px // 2}" y="{y + ROW_H // 2 + 4}" '
+                         f'fill="white" font-size="9" text-anchor="middle">{label}</text>')
+
+    # Buffer arrows
+    for be in buf_edges:
+        ri = vx_to_row.get(be["src"])
+        rj = vx_to_row.get(be["dst"])
+        if ri is None or rj is None:
+            continue
+        x1 = x0 + be["t_produce"] * PX_PER_CYCLE
+        y1 = y0 + ri * ROW_H + ROW_H // 2
+        x2 = x0 + be["t_consume"] * PX_PER_CYCLE
+        y2 = y0 + rj * ROW_H + ROW_H // 2
+        parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
+                     f'stroke="#E53935" stroke-width="1.5" stroke-dasharray="4,3" '
+                     f'marker-end="url(#arr)"/>')
+
+    # Arrow marker definition — insert after <g> (index 2)
+    parts.insert(2,
+        '<defs><marker id="arr" viewBox="0 0 10 10" refX="10" refY="5" '
+        'markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
+        '<path d="M 0 0 L 10 5 L 0 10 z" fill="#E53935"/></marker></defs>'
+    )
+
+    # Title / legend
+    ms = gx.pmap.get("makespan", "?")
+    ii = gx.pmap.get("initiation_interval", "?")
+    parts.append(f'<text x="{PAD}" y="16" fill="#eee" font-size="12" font-weight="bold">'
+                 f'Gantt — makespan={ms} cycles, II={ii}</text>')
+
+    parts.append("</g>")
+    parts.append("</svg>")
+    return "\n".join(parts).encode("utf-8")
 
 
 # --------------------------------------------------------------------------- #
@@ -292,6 +484,9 @@ g_sched.estyle["fontsize"] = lambda g, e: "10"
 
 wv = WebView()
 wv.add_graph(g, title="JEDI-linear NN-IR")
-wv.add_graph(g_sched, title="JEDI-linear Sched-IR (1st pass)")
+wv.add_graph(g_sched,    title=f"Sched-IR K=1 (baseline) — LUT={_area_weighted_lut(g_sched)}, makespan={g_sched.pmap.get('makespan')}")
+wv.add_graph(g_sched_k4, title=f"Sched-IR K=4 (hybrid) — LUT={_area_weighted_lut(g_sched_k4)}, makespan={g_sched_k4.pmap.get('makespan')}")
+wv.add_graph(GanttWrapper(g_sched),    title="Gantt K=1")
+wv.add_graph(GanttWrapper(g_sched_k4), title="Gantt K=4")
 print("Serving on http://localhost:8888  (Ctrl-C to stop)")
 wv.run(host="127.0.0.1", port="8888")

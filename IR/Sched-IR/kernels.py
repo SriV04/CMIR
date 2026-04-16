@@ -195,6 +195,99 @@ def _broadcast_reduce(arrays, binop):
     return out
 
 
+def da4ml_reduce_temporal_cost(
+    p: dict,
+    weights: WeightProvider,
+    fpga: dict,
+    *,
+    parallelism: int,
+    factor: int,
+) -> dict[str, Any]:
+    """Cost of a hybrid spatial-temporal reduction after folding.
+
+    The producer chain has been folded by ``factor`` along the same axis the
+    reduction consumes. That collapses the input fan-in to ``physical_inst =
+    ceil(parallelism / factor)`` data items per cycle for ``factor`` cycles.
+
+    Layout per channel:
+      • spatial portion — a tree of width `physical_inst`, traced through
+        `comb_trace` to get an exact da4ml LUT count.
+      • temporal portion — one accumulator adder + one accumulator register,
+        replicated across the un-reduced (channel) dimensions, running for
+        `factor` cycles.
+
+    Degenerate cases:
+      • `factor == 1` → pure spatial (caller should not invoke this; BIND's
+        cost is already correct).
+      • `physical_inst == 1` → pure temporal; spatial tree contributes nothing
+        and only the accumulator counts.
+    """
+    op_params = p.get("op_params") or {}
+    in_shape = op_params.get("in_shape")
+    in_bw = op_params.get("in_bw")
+    axes = op_params.get("axes") or []
+    keepdims = bool(op_params.get("keepdims"))
+
+    if in_shape is None or in_bw is None:
+        raise ValueError(
+            f"reduce vertex {p.get('nn_layer_name')!r}: missing in_shape/in_bw"
+        )
+
+    physical_inst = max(math.ceil(parallelism / max(factor, 1)), 1)
+
+    # Trace a per-cycle slice: replace each reduced dim with its
+    # (possibly collapsed) per-cycle width = physical_inst.
+    full_shape = tuple(d for d in in_shape[1:] if d is not None)
+    axes_in_trace = tuple(a - 1 for a in axes if a >= 1)
+
+    spatial_shape = list(full_shape)
+    for a in axes_in_trace:
+        spatial_shape[a] = physical_inst
+    spatial_shape_t = tuple(spatial_shape)
+
+    # ---- spatial tree cost (only meaningful when physical_inst > 1) ----
+    if physical_inst > 1:
+        body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
+        cost_total, latency = _da4ml.trace_lambda(
+            [spatial_shape_t],
+            [float(in_bw)],
+            body,
+            adder_size=int(fpga.get("adder_size", -1)),
+            carry_size=int(fpga.get("carry_size", -1)),
+        )
+        spatial_lut = int(round(float(cost_total)))
+        spatial_lat = int(math.ceil(float(latency[1] if isinstance(latency, (tuple, list)) else latency)))
+    else:
+        spatial_lut = 0
+        spatial_lat = 0
+
+    # ---- temporal accumulator: one adder + one register per un-reduced element
+    n_channels = 1
+    for i, d in enumerate(full_shape):
+        if i not in axes_in_trace:
+            n_channels *= int(d)
+
+    if factor > 1:
+        accum_bw_in = int(math.ceil(float(in_bw)))
+        accum_bw_out = accum_bw_in + max(int(math.ceil(math.log2(factor))), 1)
+        accum_lut = n_channels * accum_bw_out          # ~1 LUT per output bit
+        accum_ff  = n_channels * accum_bw_out          # one FF per accumulated bit
+        accum_lat = factor                              # K cycles to accumulate
+    else:
+        accum_lut = 0
+        accum_ff = 0
+        accum_lat = 0
+
+    return {
+        "lut": spatial_lut + accum_lut,
+        "ff":  accum_ff,
+        "dsp": 0,
+        "bram": 0,
+        "latency_cycles": spatial_lat + accum_lat,
+        "ii": max(int(factor), 1),
+    }
+
+
 def da4ml_activation_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
     op_params = p.get("op_params") or {}
     func = (op_params.get("func") or "linear").lower()
@@ -281,11 +374,12 @@ def lut_mux_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]
 # --------------------------------------------------------------------------- #
 
 REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
-    "da4ml_dense_cost":       da4ml_dense_cost,
-    "da4ml_reduce_cost":      da4ml_reduce_cost,
-    "da4ml_elementwise_cost": da4ml_elementwise_cost,
-    "da4ml_activation_cost":  da4ml_activation_cost,
-    "register_buffer_cost":   register_buffer_cost,
-    "bram_buffer_cost":       bram_buffer_cost,
-    "lut_mux_cost":           lut_mux_cost,
+    "da4ml_dense_cost":           da4ml_dense_cost,
+    "da4ml_reduce_cost":          da4ml_reduce_cost,
+    "da4ml_reduce_temporal_cost": da4ml_reduce_temporal_cost,
+    "da4ml_elementwise_cost":     da4ml_elementwise_cost,
+    "da4ml_activation_cost":      da4ml_activation_cost,
+    "register_buffer_cost":       register_buffer_cost,
+    "bram_buffer_cost":           bram_buffer_cost,
+    "lut_mux_cost":               lut_mux_cost,
 }

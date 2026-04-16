@@ -168,11 +168,19 @@ def vinit_sched(g, vx):
         "reuse_group":        None,   # group id shared by vertices mapped to the same
                                       # kernel instance across time (≈ kernel_instance,
                                       # but explicit for visualisation / analysis).
+        "physical_instances": None,   # how many physical copies of this kernel exist
+                                      # in hardware after folding:
+                                      #   - vertices outside any fold group: 1
+                                      #   - vertices inside a group with parallelism N
+                                      #     and fold_factor K: ceil(N / K)
+                                      # Phase 5 ROLL-UP multiplies per-instance cost by
+                                      # this value to get the total area contribution.
 
         # Reduction-specific mode (set only when op == 'reduce'):
-        "reduce_mode":        None,   # 'spatial' (tree of adders, unfolded)
-                                      # | 'temporal_accumulate' (single adder + register,
-                                      #                          consumes one input per cycle)
+        "reduce_mode":        None,   # 'spatial'             — full tree of adders, unfolded
+                                      # | 'temporal_accumulate' — pure accumulator (K = N)
+                                      # | 'hybrid'             — spatial tree of width N/K
+                                      #                          plus K-step accumulator
 
         # ---------------------------------------------------------------- #
         # Schedule (Phase 3 — SCHEDULE)

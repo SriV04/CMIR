@@ -2,4 +2,8 @@ JEDI-linear/
 heterograph/
 .claude/
 official_models/
-*/__pycache__/*/
+__pycache__/
+*.pyc
+IR/Sched-IR/__pycache__/decomposer.cpython-313.pyc
+IR/Sched-IR/__pycache__/schema.cpython-313.pyc
+IR/NN-IR/__pycache__/builder.cpython-313.pyc
