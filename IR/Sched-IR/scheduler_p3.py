@@ -174,6 +174,52 @@ def schedule(g_sched: HGraph) -> HGraph:
 
 
 # --------------------------------------------------------------------------- #
+# Phase 3.5 — steady-state throughput analysis
+# --------------------------------------------------------------------------- #
+
+def steady_state(g_sched: HGraph, *, fmax: float | None = None) -> HGraph:
+    """Compute sustained-throughput metrics after Phase 3 timing.
+
+    Adds to ``g_sched.pmap``:
+
+    * ``sustained_throughput_hz`` — ``fmax / graph_II`` (None if fmax unset).
+    * ``batches_in_flight``      — ``ceil(makespan / graph_II)``.
+    * ``throughput_bottleneck``   — vertex id(s) of the fold group that
+      limits II.
+
+    Mutates in place, returns ``g_sched``.
+    """
+    import math
+
+    graph_ii = int(g_sched.pmap.get("initiation_interval") or 1)
+    makespan = int(g_sched.pmap.get("makespan") or 1)
+
+    # Throughput in Hz (if fmax is known).
+    if fmax is None:
+        fmax = g_sched.pmap.get("target_fmax")
+    if fmax is not None:
+        fmax = float(fmax)
+        g_sched.pmap["sustained_throughput_hz"] = fmax / max(graph_ii, 1)
+    else:
+        g_sched.pmap["sustained_throughput_hz"] = None
+
+    g_sched.pmap["target_fmax"] = fmax
+
+    # Batches in flight at steady state.
+    g_sched.pmap["batches_in_flight"] = math.ceil(makespan / max(graph_ii, 1))
+
+    # Throughput bottleneck — the fold group(s) with the largest factor.
+    fold_plan = g_sched.pmap.get("fold_plan") or []
+    bottleneck_vxs: list[int] = []
+    for entry in fold_plan:
+        if entry.get("factor", 1) == graph_ii:
+            bottleneck_vxs.extend(entry.get("members") or [])
+    g_sched.pmap["throughput_bottleneck"] = bottleneck_vxs or None
+
+    return g_sched
+
+
+# --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #
 
