@@ -166,6 +166,8 @@ def _insert_buffer(
         g.pmap[e_ub]["edge_kind"]    = "data"
         g.pmap[e_ub]["t_produce"]    = ep.get("t_produce")
         g.pmap[e_ub]["t_consume"]    = bp["t_start"]
+        g.pmap[e_ub]["t_producer"]   = ep.get("t_producer", ep.get("t_produce"))
+        g.pmap[e_ub]["t_consumer"]   = bp["t_start"]
         g.pmap[e_ub]["lifetime"]     = 0   # producer → buffer is immediate
 
     created_bv = g.add_edge(buf, v)
@@ -177,6 +179,8 @@ def _insert_buffer(
         g.pmap[e_bv]["edge_kind"]    = "data"
         g.pmap[e_bv]["t_produce"]    = bp["t_end"]
         g.pmap[e_bv]["t_consume"]    = ep.get("t_consume")
+        g.pmap[e_bv]["t_producer"]   = bp["t_end"]
+        g.pmap[e_bv]["t_consumer"]   = ep.get("t_consumer", ep.get("t_consume"))
         g.pmap[e_bv]["lifetime"]     = 0   # buffer → consumer is immediate
 
     return buf

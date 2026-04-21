@@ -43,7 +43,7 @@ def _load_path(name: str, path: Path):
 
 nn_ir_builder = _load_path("nn_ir_builder", HERE / "NN-IR" / "builder.py")
 sched_decomp = _load_path("sched_decomposer", HERE / "Sched-IR" / "decomposer.py")
-sched_engine = _load_path("sched_scheduler", HERE / "Sched-IR" / "scheduler.py")
+sched_engine = _load_path("sched_scheduler", HERE / "Sched-IR" / "binder.py")
 sched_folder = _load_path("sched_folder", HERE / "Sched-IR" / "folder.py")
 sched_p3     = _load_path("sched_p3", HERE / "Sched-IR" / "scheduler_p3.py")
 sched_infra  = _load_path("sched_infra", HERE / "Sched-IR" / "infrastructure.py")
@@ -74,17 +74,40 @@ print(f"[jedi_gnn] nn-ir: {g.num_vx} vertices, {g.num_edges} edges")
 TARGET_FMAX = 300e6  # 300 MHz — typical VU13P clock
 
 
-def _build_sched(K: int):
+def _build_bind():
+    g_local = sched_decomp.decompose_nn_to_sched(g)
+    g_local = sched_engine.bind(g_local, model, RESOURCE_YAML)
+    return g_local
+
+
+def _build_unscheduled(K: int):
     g_local = sched_decomp.decompose_nn_to_sched(g)
     g_local = sched_engine.bind(g_local, model, RESOURCE_YAML)
     g_local = sched_folder.fold(g_local, factor=K)
+    return g_local
+
+
+def _build_sched(K: int):
+    g_local = _build_unscheduled(K)
     g_local = sched_p3.schedule(g_local)
     g_local = sched_p3.steady_state(g_local, fmax=TARGET_FMAX)
     g_local = sched_infra.insert_buffers(g_local)
     return g_local
 
 
+def _build_sched_p3(K: int):
+    g_local = _build_unscheduled(K)
+    g_local = sched_p3.schedule(g_local)
+    g_local = sched_p3.steady_state(g_local, fmax=TARGET_FMAX)
+    return g_local
 
+
+
+g_bind = _build_bind()                 # decompose + bind (no fold/schedule)
+g_unsched = _build_unscheduled(1)      # K=1 pre-schedule
+g_unsched_k4 = _build_unscheduled(4)   # K=4 pre-schedule
+g_sched_p3 = _build_sched_p3(1)        # baseline schedule output
+g_sched_p3_k4 = _build_sched_p3(4)     # hybrid schedule output
 g_sched = _build_sched(1)              # baseline
 g_sched_k4 = _build_sched(4)           # hybrid fold
 
@@ -105,6 +128,8 @@ def _summary(label, gx):
 
 _summary("sched K=1", g_sched)
 _summary("sched K=4", g_sched_k4)
+_summary("sched p3 K=1", g_sched_p3)
+_summary("sched p3 K=4", g_sched_p3_k4)
 
 
 # --------------------------------------------------------------------------- #
@@ -327,11 +352,11 @@ def sched_edge_penwidth(g, e):
 
 
 def _apply_sched_style(gx):
-    gx.vstyle["fillcolor"] = lambda g, vx: SCHED_COLORS.get(g.pmap[vx]["op"], "#FFFFFF")
-    gx.vstyle["shape"] = lambda g, vx: SCHED_SHAPES.get(g.pmap[vx]["op"], "box")
+    gx.vstyle["fillcolor"] = lambda g, vx: SCHED_COLORS.get(g.pmap[vx].get("op", ""), "#FFFFFF")
+    gx.vstyle["shape"] = lambda g, vx: SCHED_SHAPES.get(g.pmap[vx].get("op", ""), "box")
     gx.vstyle["style"] = lambda g, vx: "filled"
     gx.vstyle["fontcolor"] = lambda g, vx: (
-        "white" if g.pmap[vx]["op"] in ("dense", "reduce", "elementwise", "buffer", "mux") else "black"
+        "white" if g.pmap[vx].get("op") in ("dense", "reduce", "elementwise", "buffer", "mux") else "black"
     )
     gx.vstyle["penwidth"] = lambda g, vx: "3" if g.pmap[vx].get("critical_path") else "1"
     gx.vstyle["color"] = lambda g, vx: "#E53935" if g.pmap[vx].get("critical_path") else "#333333"
@@ -339,9 +364,14 @@ def _apply_sched_style(gx):
     gx.estyle["label"] = sched_edge_label
     gx.estyle["penwidth"] = sched_edge_penwidth
     gx.estyle["fontsize"] = lambda g, e: "10"
-    gx.estyle["color"] = lambda g, e: "#E53935" if g.pmap[e].get("lifetime", 0) > 0 else "#666666"
+    gx.estyle["color"] = lambda g, e: "#E53935" if (g.pmap[e].get("lifetime") or 0) > 0 else "#666666"
 
 
+_apply_sched_style(g_bind)
+_apply_sched_style(g_unsched)
+_apply_sched_style(g_unsched_k4)
+_apply_sched_style(g_sched_p3)
+_apply_sched_style(g_sched_p3_k4)
 _apply_sched_style(g_sched)
 _apply_sched_style(g_sched_k4)
 
@@ -474,9 +504,11 @@ def _render_gantt_svg(gx):
         rj = vx_to_row.get(be["dst"])
         if ri is None or rj is None:
             continue
-        x1 = x0 + be["t_produce"] * PX_PER_CYCLE
+        t_producer = be.get("t_producer", be["t_produce"])
+        t_consumer = be.get("t_consumer", be["t_consume"])
+        x1 = x0 + t_producer * PX_PER_CYCLE
         y1 = y0 + ri * ROW_H + ROW_H // 2
-        x2 = x0 + be["t_consume"] * PX_PER_CYCLE
+        x2 = x0 + t_consumer * PX_PER_CYCLE
         y2 = y0 + rj * ROW_H + ROW_H // 2
         parts.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" '
                      f'stroke="#E53935" stroke-width="1.5" stroke-dasharray="4,3" '
@@ -521,6 +553,11 @@ def _tab_title(label, gx):
 
 wv = WebView()
 wv.add_graph(g, title="JEDI-linear NN-IR")
+wv.add_graph(g_bind,     title="Sched BIND (unscheduled)")
+wv.add_graph(g_unsched,  title="Sched K=1 (unscheduled)")
+wv.add_graph(g_unsched_k4, title="Sched K=4 (unscheduled)")
+wv.add_graph(g_sched_p3,   title=_tab_title("Sched P3 K=1", g_sched_p3))
+wv.add_graph(g_sched_p3_k4, title=_tab_title("Sched P3 K=4", g_sched_p3_k4))
 wv.add_graph(g_sched,    title=_tab_title("Sched K=1", g_sched))
 wv.add_graph(g_sched_k4, title=_tab_title("Sched K=4", g_sched_k4))
 wv.add_graph(GanttWrapper(g_sched),    title=_tab_title("Gantt K=1", g_sched))

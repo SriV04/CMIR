@@ -150,9 +150,13 @@ def schedule(g_sched: HGraph) -> HGraph:
         pu = g_sched.pmap[u]
         pv = g_sched.pmap[v]
         ep = g_sched.pmap[(u, v)]
-        ep["t_produce"] = _first_output_cycle(pu)
-        ep["t_consume"] = int(pv["t_start"])
-        ep["lifetime"]  = max(ep["t_consume"] - ep["t_produce"], 0)
+        t_producer = _first_output_cycle(pu)
+        t_consumer = int(pv["t_start"])
+        ep["t_produce"] = t_producer
+        ep["t_consume"] = t_consumer
+        ep["t_producer"] = t_producer
+        ep["t_consumer"] = t_consumer
+        ep["lifetime"]  = max(t_consumer - t_producer, 0)
 
     # ---- graph-level -------------------------------------------------- #
     makespan = max(int(g_sched.pmap[v]["t_end"]) for v in g_sched.vertices)
@@ -235,7 +239,12 @@ def _validate_schedule(g: HGraph) -> None:
 
     for u, v in g.edges:
         ep = g.pmap[(u, v)]
-        if ep.get("t_produce") is None or ep.get("t_consume") is None:
+        if (
+            ep.get("t_produce") is None
+            or ep.get("t_consume") is None
+            or ep.get("t_producer") is None
+            or ep.get("t_consumer") is None
+        ):
             raise ValueError(f"SCHEDULE left edge ({u},{v}) without timing")
         if ep["lifetime"] < 0:
             raise ValueError(f"SCHEDULE edge ({u},{v}): negative lifetime")

@@ -210,13 +210,15 @@ def einit_sched(g, e):
         # ---------------------------------------------------------------- #
         "t_produce":          None,   # cycle at which source emits this value
         "t_consume":          None,   # cycle at which sink reads this value
+        "t_producer":         None,   # alias of t_produce for clearer edge naming
+        "t_consumer":         None,   # alias of t_consume for clearer edge naming
         "lifetime":           None,   # t_consume - t_produce
                                       # lifetime > 1 ⇒ storage required between cycles
         "fold_iteration":     None,   # when source/sink are folded, which iteration of
                                       # the fold this edge instance carries
 
         # ---------------------------------------------------------------- #
-        # Buffering (Phase 4 — INSERT INFRASTRUCTURE)
+        # Buffering (Phase 4 — INSERT INFRASTRUCTURE) - ARCH IR ONLY
         # ---------------------------------------------------------------- #
         # Populated on edges that the scheduler decides need explicit storage.
         # The scheduler may replace such an edge with an inserted `buffer`
@@ -228,7 +230,7 @@ def einit_sched(g, e):
         "buffer_total_bits":  None,   # depth * width_bits
 
         # ---------------------------------------------------------------- #
-        # Mux (Phase 4) — only set if this edge feeds an inserted mux vertex
+        # Mux (Phase 4) — only set if this edge feeds an inserted mux vertex  - ARCH IR ONLY
         # ---------------------------------------------------------------- #
         "mux_select":         None,   # which select line this edge corresponds to
     }
