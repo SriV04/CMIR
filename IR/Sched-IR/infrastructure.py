@@ -146,10 +146,19 @@ def _insert_buffer(
     cost_fn = _kernels.REGISTRY[kernel_name + "_cost"]
     bp["cost"] = cost_fn(bp, _kernels.WeightProvider(None), fpga)
 
+    # Buffers have trivial N–P–T: one lane, one temporal step, no pipeline.
+    buf_lat                 = int(bp["cost"].get("latency_cycles") or 1)
+    bp["parallelism_N"]      = 1
+    bp["lanes_P"]            = 1
+    bp["temporal_steps_T"]   = 1
+    bp["pipeline_latency_L"] = buf_lat
+    bp["elements_per_cycle"] = 1
+    bp["ii"]                 = 1
+    bp["latency_total"]      = buf_lat
+
     # Timing: the buffer sits in the gap — it doesn't extend the schedule.
     bp["t_start"]       = int(g.pmap[u].get("t_end") or 0)
     bp["t_ready"]       = bp["t_start"]
-    buf_lat             = int(bp["cost"].get("latency_cycles") or 1)
     bp["t_end"]         = bp["t_start"] + buf_lat
     bp["critical_path"] = False
 

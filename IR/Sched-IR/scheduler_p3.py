@@ -41,22 +41,34 @@ def _topo_sort(g: HGraph) -> list[int]:
 
 
 # --------------------------------------------------------------------------- #
-# Timing helpers
+# Timing helpers — N–P–T model (T = ceil(N/P), II = T, L_total = L + (T-1))
 # --------------------------------------------------------------------------- #
 
-def _latency(p: dict) -> int:
-    """Pipeline depth L for a vertex, clamped to >= 1."""
+def _pipeline_L(p: dict) -> int:
+    """Pipeline depth L for a vertex, clamped to >= 1.
+
+    Prefer the explicit ``pipeline_latency_L`` written by FOLD; fall back
+    to ``cost.latency_cycles`` for pre-fold graphs / infrastructure nodes.
+    """
+    explicit = p.get("pipeline_latency_L")
+    if explicit is not None:
+        return max(int(explicit), 1)
     cost = p.get("cost") or {}
     return max(int(cost.get("latency_cycles") or 0), 1)
 
 
-def _fold_factor(p: dict) -> int:
+def _temporal_steps_T(p: dict) -> int:
+    """Temporal-step count T for a vertex, clamped to >= 1."""
+    explicit = p.get("temporal_steps_T")
+    if explicit is not None:
+        return max(int(explicit), 1)
+    # Legacy fallback (scheduler-inserted buffers/muxes, unfolded graphs).
     return max(int(p.get("fold_factor") or 1), 1)
 
 
 def _first_output_cycle(p: dict) -> int:
     """Cycle at which the first pipeline result is valid."""
-    return int(p["t_start"]) + _latency(p)
+    return int(p["t_start"]) + _pipeline_L(p)
 
 
 def _is_temporalised_reduce(p: dict) -> bool:
@@ -78,14 +90,14 @@ def _first_output_for_consumer(g: HGraph, pred: int, consumer: int) -> int:
     * **Same fold group, normal consumer**: first pipeline result. The
       consumer is rate-matched and processes items in lockstep.
     * **Cross-fold (different groups or one is unfolded)**: the consumer
-      waits for `pred.t_end` — it needs all K items before it can start.
-    * **Producer is unfolded (K=1)**: same as `first_output_cycle`.
+      waits for `pred.t_end` — it needs all T items before it can start.
+    * **Producer has T=1 (fully spatial)**: same as `first_output_cycle`.
     """
     pp = g.pmap[pred]
     pc = g.pmap[consumer]
-    pred_K = _fold_factor(pp)
+    pred_T = _temporal_steps_T(pp)
 
-    if pred_K <= 1:
+    if pred_T <= 1:
         return _first_output_cycle(pp)
 
     if _same_fold_group(pp, pc):
@@ -132,8 +144,8 @@ def schedule(g_sched: HGraph) -> HGraph:
     # ---- vertex timing ------------------------------------------------ #
     for vx in order:
         p = g_sched.pmap[vx]
-        L = _latency(p)
-        K = _fold_factor(p)
+        L = _pipeline_L(p)
+        T = _temporal_steps_T(p)
 
         preds = g_sched.in_vx(vx)
         if not preds:
@@ -141,9 +153,15 @@ def schedule(g_sched: HGraph) -> HGraph:
         else:
             t_ready = max(_first_output_for_consumer(g_sched, pred, vx) for pred in preds)
 
+        # N–P–T model: t_end = t_start + L + (T - 1) = t_start + latency_total.
         p["t_ready"] = t_ready
         p["t_start"] = t_ready
-        p["t_end"]   = t_ready + L + max(K - 1, 0)
+        p["t_end"]   = t_ready + L + max(T - 1, 0)
+
+        # Keep the node-level latency_total in sync with the schedule — FOLD
+        # may not have run (e.g. for scheduler-inserted buffers).
+        p["latency_total"] = int(L + max(T - 1, 0))
+        p["ii"]            = int(T)
 
     # ---- edge timing -------------------------------------------------- #
     for u, v in g_sched.edges:
@@ -162,13 +180,17 @@ def schedule(g_sched: HGraph) -> HGraph:
     makespan = max(int(g_sched.pmap[v]["t_end"]) for v in g_sched.vertices)
     g_sched.pmap["makespan"] = makespan
 
-    fold_plan = g_sched.pmap.get("fold_plan") or []
-    graph_ii = max((entry.get("factor", 1) for entry in fold_plan), default=1)
+    # Graph II = max over every compute node's II. Falls back to 1 when the
+    # graph is empty or only contains scheduler-inserted infrastructure.
+    graph_ii = max(
+        (_temporal_steps_T(g_sched.pmap[v]) for v in g_sched.vertices),
+        default=1,
+    )
     g_sched.pmap["initiation_interval"] = int(graph_ii)
 
     crit = _find_critical_path(g_sched, order)
     g_sched.pmap["critical_path"] = crit
-    g_sched.pmap["pipeline_depth"] = sum(_latency(g_sched.pmap[v]) for v in crit)
+    g_sched.pmap["pipeline_depth"] = sum(_pipeline_L(g_sched.pmap[v]) for v in crit)
 
     for vx in g_sched.vertices:
         g_sched.pmap[vx]["critical_path"] = vx in crit
@@ -212,11 +234,12 @@ def steady_state(g_sched: HGraph, *, fmax: float | None = None) -> HGraph:
     # Batches in flight at steady state.
     g_sched.pmap["batches_in_flight"] = math.ceil(makespan / max(graph_ii, 1))
 
-    # Throughput bottleneck — the fold group(s) with the largest factor.
+    # Throughput bottleneck — the fold group(s) whose T equals the graph II.
     fold_plan = g_sched.pmap.get("fold_plan") or []
     bottleneck_vxs: list[int] = []
     for entry in fold_plan:
-        if entry.get("factor", 1) == graph_ii:
+        T_grp = entry.get("temporal_steps", entry.get("factor", 1))
+        if T_grp == graph_ii:
             bottleneck_vxs.extend(entry.get("members") or [])
     g_sched.pmap["throughput_bottleneck"] = bottleneck_vxs or None
 
@@ -236,6 +259,24 @@ def _validate_schedule(g: HGraph) -> None:
             raise ValueError(f"SCHEDULE vertex {vx}: t_end < t_start + 1")
         if p["t_start"] < p.get("t_ready", 0):
             raise ValueError(f"SCHEDULE vertex {vx}: t_start < t_ready")
+
+        # N–P–T invariants on compute nodes (infrastructure nodes skip FOLD).
+        if p.get("op") in ("buffer", "mux"):
+            continue
+        L = _pipeline_L(p)
+        T = _temporal_steps_T(p)
+        expected_end = int(p["t_start"]) + L + max(T - 1, 0)
+        if int(p["t_end"]) != expected_end:
+            raise ValueError(
+                f"SCHEDULE vertex {vx}: t_end={p['t_end']} != t_start+L+(T-1)={expected_end}"
+            )
+        if int(p.get("ii") or 0) != T:
+            raise ValueError(f"SCHEDULE vertex {vx}: ii={p.get('ii')} != T={T}")
+        if int(p.get("latency_total") or 0) != L + max(T - 1, 0):
+            raise ValueError(
+                f"SCHEDULE vertex {vx}: latency_total={p.get('latency_total')} "
+                f"!= L+(T-1)={L + max(T - 1, 0)}"
+            )
 
     for u, v in g.edges:
         ep = g.pmap[(u, v)]

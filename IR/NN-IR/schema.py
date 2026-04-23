@@ -34,6 +34,10 @@ def vinit_nn(g, vx):
 
         # --- Parameter count ---
         'num_params':   None,
+
+        # --- Data fields ---
+        'weights':      None,    # weight matrix
+        'biases':       None,    # bias vector
     }
 
 def einit_nn(g, e):

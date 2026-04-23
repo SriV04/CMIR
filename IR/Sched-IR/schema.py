@@ -145,9 +145,30 @@ def vinit_sched(g, vx):
                                       #     'ff':             int,
                                       #     'dsp':            int,
                                       #     'bram':           int,
-                                      #     'latency_cycles': int,   # L
-                                      #     'ii':             int,   # initiation interval
+                                      #     'latency_cycles': int,   # L (kernel pipeline depth)
+                                      #     'ii':             int,   # = T (mirrors node.ii)
                                       #   }
+
+        # ---------------------------------------------------------------- #
+        # N–P–T timing model (populated by FOLD; read by SCHEDULE)
+        # ---------------------------------------------------------------- #
+        # Every compute vertex obeys the invariants
+        #     T  == ceil(N / P)
+        #     II == T
+        #     latency_total == L + (T - 1)
+        # so II and latency_total are never assigned independently of (N, P, L).
+        "parallelism_N":      None,   # logical parallelism — size of the fold axis.
+                                      # For vertices outside any fold group: 1.
+        "lanes_P":            None,   # hardware parallel lanes (work per cycle).
+                                      # For dense: number of physical kernel copies.
+                                      # For reduce: spatial width of the reduction
+                                      #             (P_reduce — elements consumed per cycle).
+        "temporal_steps_T":   None,   # = ceil(N / P). Cycles to finish one batch of work.
+        "pipeline_latency_L": None,   # intrinsic kernel pipeline depth (mirrors cost.latency_cycles).
+        "elements_per_cycle": None,   # = P. Explicit for transport / bandwidth analyses.
+        "ii":                 None,   # initiation interval = T.
+        "latency_total":      None,   # total cycles from accepting inputs to final output
+                                      # = L + (T - 1).
 
         # ---------------------------------------------------------------- #
         # Folding (Phase 2 — FOLD)
@@ -158,10 +179,12 @@ def vinit_sched(g, vx):
                                       # Reductions that *consume* an axis list it
                                       # here too, and then switch to temporal
                                       # accumulation during FOLD.
-        "fold_factor":        None,   # K: how many logical ops collapse into one instance
-                                      # (1 = fully spatial, N = fully folded).
-        "fold_iteration":     None,   # this vertex represents iteration k of the fold
-                                      # (0 <= k < fold_factor). None until expansion.
+        "fold_factor":        None,   # Legacy alias for ``temporal_steps_T`` — kept for
+                                      # back-compat with tooling that hasn't migrated yet.
+                                      # Semantically identical to T (1 = fully spatial,
+                                      # N = fully temporal).
+        "fold_iteration":     None,   # this vertex represents iteration t of the fold
+                                      # (0 <= t < temporal_steps_T). None until expansion.
         "fold_group":         None,   # group id shared by vertices that *must* fold
                                       # together (symmetric-fold constraint, e.g. the
                                       # self-path dense and the QAdd that consumes it).
@@ -171,10 +194,12 @@ def vinit_sched(g, vx):
         "physical_instances": None,   # how many physical copies of this kernel exist
                                       # in hardware after folding:
                                       #   - vertices outside any fold group: 1
-                                      #   - vertices inside a group with parallelism N
-                                      #     and fold_factor K: ceil(N / K)
+                                      #   - vertices inside a group: ceil(N / T) = P
                                       # Phase 5 ROLL-UP multiplies per-instance cost by
                                       # this value to get the total area contribution.
+                                      # For reductions this is a legacy alias of lanes_P
+                                      # (P_reduce), which is the spatial reduce-tree width,
+                                      # not the number of independent trees.
 
         # Reduction-specific mode (set only when op == 'reduce'):
         "reduce_mode":        None,   # 'spatial'             — full tree of adders, unfolded
@@ -188,8 +213,8 @@ def vinit_sched(g, vx):
         "t_ready":            None,   # cycle at which all inputs are available
         "t_start":            None,   # cycle this op begins
         "t_end":              None,   # cycle this op completes
-                                      # unfolded: t_start + cost.latency_cycles
-                                      # folded:   t_start + fold_factor * cost.ii
+                                      # t_end == t_start + latency_total
+                                      #       == t_start + L + (T - 1)
         "critical_path":      False,  # set by the scheduler if this vertex lies on
                                       # the critical path of the final schedule.
     }

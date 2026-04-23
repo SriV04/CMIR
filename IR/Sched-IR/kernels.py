@@ -203,24 +203,27 @@ def da4ml_reduce_temporal_cost(
     parallelism: int,
     factor: int,
 ) -> dict[str, Any]:
-    """Cost of a hybrid spatial-temporal reduction after folding.
+    """Cost of a spatial+temporal reduction under the N–P–T model.
 
-    The producer chain has been folded by ``factor`` along the same axis the
-    reduction consumes. That collapses the input fan-in to ``physical_inst =
-    ceil(parallelism / factor)`` data items per cycle for ``factor`` cycles.
+    Arguments are:
 
-    Layout per channel:
-      • spatial portion — a tree of width `physical_inst`, traced through
-        `comb_trace` to get an exact da4ml LUT count.
-      • temporal portion — one accumulator adder + one accumulator register,
-        replicated across the un-reduced (channel) dimensions, running for
-        `factor` cycles.
+    * ``parallelism`` — N, the size of the folded (reduced) axis.
+    * ``factor``      — T, the temporal step count = ceil(N / P_reduce).
 
-    Degenerate cases:
-      • `factor == 1` → pure spatial (caller should not invoke this; BIND's
-        cost is already correct).
-      • `physical_inst == 1` → pure temporal; spatial tree contributes nothing
-        and only the accumulator counts.
+    From these we derive ``P_reduce = ceil(N / T)`` — the number of elements
+    the reduction consumes per cycle. Three regimes:
+
+    * ``P_reduce == N``  (T == 1) — *spatial*: one full tree, no accumulator.
+      Caller should normally not hit this branch; BIND's cost already
+      covers it.
+    * ``P_reduce == 1``  (T == N) — *temporal_accumulate*: one accumulator,
+      no spatial tree.
+    * ``1 < P_reduce < N`` — *hybrid*: spatial tree of width P_reduce plus a
+      T-step accumulator, replicated across the un-reduced (channel) dims.
+
+    The cost dict returned has ``ii = T`` and ``latency_cycles = L_reduce``
+    (spatial tree + accumulator depth). The caller is responsible for
+    writing ``latency_total = L_reduce + (T - 1)`` on the vertex.
     """
     op_params = p.get("op_params") or {}
     in_shape = op_params.get("in_shape")
@@ -233,20 +236,22 @@ def da4ml_reduce_temporal_cost(
             f"reduce vertex {p.get('nn_layer_name')!r}: missing in_shape/in_bw"
         )
 
-    physical_inst = max(math.ceil(parallelism / max(factor, 1)), 1)
+    N = int(parallelism)
+    T = max(int(factor), 1)
+    P_reduce = max(math.ceil(N / T), 1)
 
     # Trace a per-cycle slice: replace each reduced dim with its
-    # (possibly collapsed) per-cycle width = physical_inst.
+    # (possibly collapsed) per-cycle width = P_reduce.
     full_shape = tuple(d for d in in_shape[1:] if d is not None)
     axes_in_trace = tuple(a - 1 for a in axes if a >= 1)
 
     spatial_shape = list(full_shape)
     for a in axes_in_trace:
-        spatial_shape[a] = physical_inst
+        spatial_shape[a] = P_reduce
     spatial_shape_t = tuple(spatial_shape)
 
-    # ---- spatial tree cost (only meaningful when physical_inst > 1) ----
-    if physical_inst > 1:
+    # ---- spatial tree cost (only meaningful when P_reduce > 1) ----
+    if P_reduce > 1:
         body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
         cost_total, latency = _da4ml.trace_lambda(
             [spatial_shape_t],
@@ -267,12 +272,15 @@ def da4ml_reduce_temporal_cost(
         if i not in axes_in_trace:
             n_channels *= int(d)
 
-    if factor > 1:
+    # The accumulator's intrinsic *pipeline depth* L is one adder stage; the
+    # T-step accumulation is reflected via ii=T and latency_total=L+(T-1) by
+    # the caller — we must not double-count it here.
+    if T > 1:
         accum_bw_in = int(math.ceil(float(in_bw)))
-        accum_bw_out = accum_bw_in + max(int(math.ceil(math.log2(factor))), 1)
+        accum_bw_out = accum_bw_in + max(int(math.ceil(math.log2(T))), 1)
         accum_lut = n_channels * accum_bw_out          # ~1 LUT per output bit
         accum_ff  = n_channels * accum_bw_out          # one FF per accumulated bit
-        accum_lat = factor                              # K cycles to accumulate
+        accum_lat = 1                                   # one adder stage in the datapath
     else:
         accum_lut = 0
         accum_ff = 0
@@ -283,8 +291,8 @@ def da4ml_reduce_temporal_cost(
         "ff":  accum_ff,
         "dsp": 0,
         "bram": 0,
-        "latency_cycles": spatial_lat + accum_lat,
-        "ii": max(int(factor), 1),
+        "latency_cycles": spatial_lat + accum_lat,   # L_reduce (pipeline depth only)
+        "ii": T,                                      # = T, matches node.ii
     }
 
 
