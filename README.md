@@ -12,6 +12,20 @@ CMIR is a project focused on the analysis, IR (Information Retrieval) generation
 - `heterograph/`: Graph visualization library used for the IR web viewer.
 - `official_models/`: Directory for storing pretrained model weights.
 
+## Terminology
+
+**Logical Input:** the full logical tensor for that node. ****
+
+**Work Unit** as a single element, $(1 \times C)$. 
+
+**Parallelisation P**  - within DA4ML parallelisation equals replicating compute lanes across a tensor axis. So for our mental model, parallelisation equals the number of lanes, p. 
+
+**Temporal steps T** are the number of cycles required to ISSUE all work for one logical input. 
+
+**Initiation interval II** measured at the granularity of a full logical input - number of cycles before the SAME kernel can accept a NEW logical input
+
+**Latency** = L_pipeline + (T-1), cycles required for one logical input to produce an output
+
 ## Setup Instructions
 
 ### 1. Clone the Repository
@@ -82,3 +96,5 @@ model.load_weights("official_models/jedi_linear_8p.keras")
 
 ## Hardware Resource Analysis
 The scheduling engine uses `IR/Sched-IR/da4ml-resource.yaml` to define the target hardware (e.g., Xilinx VU13P) and the cost functions for the `da4ml` estimator. You can modify this file to target different devices or resource constraints.
+
+
