@@ -46,8 +46,40 @@ def _load_sibling(name: str):
 
 
 _kernels = _load_sibling("kernels")
+_da4ml = _load_sibling("_da4ml")
 WeightProvider = _kernels.WeightProvider
 REGISTRY: dict[str, Callable[..., dict[str, Any]]] = _kernels.REGISTRY
+
+
+# --------------------------------------------------------------------------- #
+# fpga-config normalisation (resolves "auto" values from the resource YAML)
+# --------------------------------------------------------------------------- #
+
+def normalize_fpga(fpga: dict[str, Any]) -> dict[str, Any]:
+    """Resolve `latency_cutoff: auto` (and similar) in the fpga config.
+
+    Mutates a copy and returns it. Idempotent — calling on an already-resolved
+    dict is a no-op. The same function is used by `evaluate.py` so that path A
+    (end-to-end ground truth) and path B (per-layer Sched-IR) read the same
+    `latency_cutoff` from the same resource YAML.
+    """
+    fpga = dict(fpga or {})
+
+    cutoff = fpga.get("latency_cutoff", "auto")
+    if isinstance(cutoff, str) and cutoff.strip().lower() == "auto":
+        derived = _da4ml.derive_latency_cutoff(
+            target_fmax_hz=float(fpga.get("target_fmax_hz") or 0.0),
+            t_logic_ns=float(fpga.get("t_logic_ns") or 1.00),
+            routing_margin=float(fpga.get("routing_margin") or 0.30),
+        )
+        fpga["latency_cutoff"] = int(derived)
+    else:
+        try:
+            fpga["latency_cutoff"] = int(cutoff)
+        except (TypeError, ValueError):
+            fpga["latency_cutoff"] = -1
+
+    return fpga
 
 
 # --------------------------------------------------------------------------- #
@@ -157,12 +189,14 @@ def bind(
     """
     cfg_path = Path(resource_yaml_path).resolve()
     cfg = yaml.safe_load(cfg_path.read_text())
-    fpga = cfg.get("fpga") or {}
+    fpga = normalize_fpga(cfg.get("fpga") or {})
+    cfg["fpga"] = fpga   # write back so downstream loaders see the resolved values
     library = build_kernel_library(cfg)
     weights = WeightProvider(keras_model)
 
     g_sched.pmap["resource_yaml"] = str(cfg_path)
     g_sched.pmap["target_device"] = fpga.get("device")
+    g_sched.pmap["fpga_config"]   = fpga   # cache for downstream phases (folder, evaluate)
 
     next_instance: dict[str, int] = {}
 

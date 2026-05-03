@@ -206,9 +206,23 @@ def _rollup(g: HGraph) -> None:
     for vx in g.vertices:
         p = g.pmap[vx]
         cost = p.get("cost") or {}
-        inst = int(p.get("physical_instances") or 1)
+        op = p.get("op") or ""
+
+        # ``physical_instances`` is the lane count P. For dense, BIND returns
+        # a per-lane cost (one CMVM solution), so the rollup multiplies by P
+        # to get the broadcast hardware footprint. For reduce/elementwise the
+        # da4ml cost query traces the *full* tensor shape and returns a cost
+        # for the entire structure (one shared sum tree, one set of adders);
+        # multiplying by P would replicate that structure spuriously. Buffers
+        # and muxes are also full-structure costs (always physical_instances=1
+        # in practice, but we treat them the same way for safety).
+        if op in ("reduce", "elementwise", "buffer", "mux"):
+            mult = 1
+        else:
+            mult = int(p.get("physical_instances") or 1)
+
         for ck, gk in key_map.items():
-            totals[gk] += int(cost.get(ck) or 0) * inst
+            totals[gk] += int(cost.get(ck) or 0) * mult
 
     for k, v in totals.items():
         g.pmap[k] = v

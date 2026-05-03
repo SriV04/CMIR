@@ -99,13 +99,13 @@ def da4ml_dense_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, 
         kernel = kernel.reshape(-1, kernel.shape[-1])
 
     in_qint = _da4ml.qint_from_bw(in_bw)
-    cost_total, latency = _da4ml.solve_dense(
+    return _da4ml.solve_dense(
         kernel,
         in_qint,
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
+        latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
-    return _da4ml.to_cost_dict(cost_total, latency)
 
 
 def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
@@ -139,14 +139,14 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     else:
         raise NotImplementedError(f"reduce mode {mode!r} not supported")
 
-    cost_total, latency = _da4ml.trace_lambda(
+    return _da4ml.trace_lambda(
         [trace_shape],
         [float(in_bw)],
         body,
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
+        latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
-    return _da4ml.to_cost_dict(cost_total, latency)
 
 
 def da4ml_elementwise_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
@@ -176,14 +176,14 @@ def da4ml_elementwise_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict
     else:
         raise NotImplementedError(f"elementwise op {op!r} not supported")
 
-    cost_total, latency = _da4ml.trace_lambda(
+    return _da4ml.trace_lambda(
         trace_shapes,
         [float(b) for b in in_bws],
         body,
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
+        latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
-    return _da4ml.to_cost_dict(cost_total, latency)
 
 
 def _broadcast_reduce(arrays, binop):
@@ -253,17 +253,20 @@ def da4ml_reduce_temporal_cost(
     # ---- spatial tree cost (only meaningful when P_reduce > 1) ----
     if P_reduce > 1:
         body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
-        cost_total, latency = _da4ml.trace_lambda(
+        spatial_cost = _da4ml.trace_lambda(
             [spatial_shape_t],
             [float(in_bw)],
             body,
             adder_size=int(fpga.get("adder_size", -1)),
             carry_size=int(fpga.get("carry_size", -1)),
+            latency_cutoff=int(fpga.get("latency_cutoff", -1)),
         )
-        spatial_lut = int(round(float(cost_total)))
-        spatial_lat = int(math.ceil(float(latency[1] if isinstance(latency, (tuple, list)) else latency)))
+        spatial_lut = int(spatial_cost["lut"])
+        spatial_ff  = int(spatial_cost["ff"])
+        spatial_lat = int(spatial_cost["latency_cycles"])
     else:
         spatial_lut = 0
+        spatial_ff = 0
         spatial_lat = 0
 
     # ---- temporal accumulator: one adder + one register per un-reduced element
@@ -288,7 +291,7 @@ def da4ml_reduce_temporal_cost(
 
     return {
         "lut": spatial_lut + accum_lut,
-        "ff":  accum_ff,
+        "ff":  spatial_ff + accum_ff,
         "dsp": 0,
         "bram": 0,
         "latency_cycles": spatial_lat + accum_lat,   # L_reduce (pipeline depth only)
@@ -314,14 +317,14 @@ def da4ml_activation_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[
 
     if func == "relu":
         body = lambda x: _da4ml.relu(x)  # noqa: E731
-        cost_total, latency = _da4ml.trace_lambda(
+        return _da4ml.trace_lambda(
             [trace_shape],
             [float(in_bw)],
             body,
             adder_size=int(fpga.get("adder_size", -1)),
             carry_size=int(fpga.get("carry_size", -1)),
+            latency_cutoff=int(fpga.get("latency_cutoff", -1)),
         )
-        return _da4ml.to_cost_dict(cost_total, latency)
 
     # TODO: route sigmoid/tanh/softmax through a LUT-based estimator. For
     # now flag it loudly so we notice the day a non-ReLU activation appears.

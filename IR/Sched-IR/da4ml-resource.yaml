@@ -18,6 +18,28 @@ fpga:
   adder_size: -1     # -1 = ideal-adder mode (1 cell per addition); set to 6 for LUT6
   carry_size: -1     # -1 = ideal latency mode (1 cycle per addition); set to 4 for VU13P CARRY8
 
+  # ---- Pipelining configuration --------------------------------------- #
+  # `latency_cutoff` is the budget of "logic levels" (in da4ml's units) per
+  # pipeline stage. It governs both the per-layer cost queries (path B) and
+  # the end-to-end ground truth (path A); they read the same value.
+  #
+  # Set explicitly to an integer (e.g. 2 for VU13P @ 300 MHz with carry_size=-1),
+  # or leave as `auto` to derive it from target_fmax_hz, t_logic_ns and
+  # routing_margin via `_da4ml.derive_latency_cutoff`:
+  #
+  #     cutoff = floor(T_clk_ns × (1 - routing_margin) / t_logic_ns)
+  #
+  # The defaults give cutoff=2 for VU13P + 300 MHz + ideal-mode (matches the
+  # JEDI-linear paper). Override `t_logic_ns` per device family:
+  #     VU13P  carry_size=-1 → 1.00 ns
+  #     VU13P  carry_size= 4 → 0.65 ns   (CARRY8 four-bit chunk)
+  #     VU13P  carry_size= 8 → 0.95 ns   (CARRY8 full)
+  #     S10    carry_size=-1 → 0.85 ns
+  target_fmax_hz: 300_000_000
+  latency_cutoff: auto       # integer override or "auto"
+  t_logic_ns:     1.00       # mean per-logic-level delay (device-dependent)
+  routing_margin: 0.30       # fraction of T_clk reserved for routing/setup
+
 kernels:
 
   # ---- Compute kernels (da4ml-driven cost queries) -------------------- #

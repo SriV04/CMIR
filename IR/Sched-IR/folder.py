@@ -196,14 +196,18 @@ def fold(
     if lanes is not None and lanes < 1:
         raise ValueError(f"fold lanes must be >= 1, got {lanes}")
 
-    # Reload the resource YAML stamped on the graph by BIND to recover fpga
-    # config + the cost-query callables. fpga is needed by the temporal-
-    # reduce cost query.
-    yaml_path = g_sched.pmap.get("resource_yaml")
-    if yaml_path is None:
-        raise ValueError("fold() requires bind() to have run first (no resource_yaml on the graph)")
-    cfg = yaml.safe_load(Path(yaml_path).read_text())
-    fpga = cfg.get("fpga") or {}
+    # BIND caches the *resolved* fpga config on the graph (with `latency_cutoff:
+    # auto` already turned into an integer). Prefer that; fall back to
+    # re-loading + re-normalising the YAML if BIND didn't run for some reason.
+    fpga = g_sched.pmap.get("fpga_config")
+    if not fpga:
+        yaml_path = g_sched.pmap.get("resource_yaml")
+        if yaml_path is None:
+            raise ValueError("fold() requires bind() to have run first (no resource_yaml on the graph)")
+        cfg = yaml.safe_load(Path(yaml_path).read_text())
+        # Use the same normaliser BIND uses, loaded via importlib (sibling dir).
+        binder = _load_sibling("binder")
+        fpga = binder.normalize_fpga(cfg.get("fpga") or {})
 
     # ---------------------------------------------------------------- #
     # 1. Build fold groups via union-find over constraint edges

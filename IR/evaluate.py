@@ -11,6 +11,7 @@ Run from the CMIR repo root:
 
 from __future__ import annotations
 
+import glob
 import importlib.util
 import json
 import math
@@ -30,6 +31,7 @@ REPO = HERE.parent
 os.environ.setdefault("KERAS_BACKEND", "jax")
 sys.path.insert(0, str(REPO / "JEDI-linear" / "src"))
 sys.path.insert(0, str(REPO / "heterograph"))
+sys.path.insert(0, str(HERE))   # so `import plot` resolves
 
 
 # --------------------------------------------------------------------------- #
@@ -56,21 +58,61 @@ RESOURCE_YAML = HERE / "Sched-IR" / "da4ml-resource.yaml"
 from model import get_gnn  # from JEDI-linear/src
 from heterograph import HGraph
 
+import yaml as _yaml
 
 # --------------------------------------------------------------------------- #
 # Build model + NN-IR (shared across all sweeps)
 # --------------------------------------------------------------------------- #
 
-TARGET_FMAX = 300e6  # 300 MHz — typical VU13P clock
+# Single source of truth: read fpga config from the resource YAML and resolve
+# `latency_cutoff: auto` once. Both path A (end-to-end ground truth) and path B
+# (per-layer Sched-IR via BIND) read the same value from this dict.
+_RESOURCE_CFG  = _yaml.safe_load(RESOURCE_YAML.read_text())
+_FPGA_CFG      = sched_engine.normalize_fpga(_RESOURCE_CFG.get("fpga") or {})
 
-conf = SimpleNamespace(n_constituents=8, pt_eta_phi=True)
-model = get_gnn(conf)
+TARGET_FMAX             = float(_FPGA_CFG.get("target_fmax_hz") or 300e6)
+PIPELINE_LATENCY_CUTOFF = int(_FPGA_CFG.get("latency_cutoff", -1))
+N_CONSTITUENTS = 8
+USE_PERMINV = True            # uq1 variant — matches JEDI-linear paper's permutation-invariant model
+LOAD_TRAINED_WEIGHTS = True   # required for realistic DA cost (random weights yield trivially low cost)
+
+# JEDI-linear's official_models tarball stores trained checkpoints we should reuse.
+_VARIANT_DIR = "3-feature-perminv" if USE_PERMINV else "3-feature"
+_CHECKPOINT_GLOB = (
+    REPO / "official_models" / _VARIANT_DIR / f"jet_classifier_large_{N_CONSTITUENTS}"
+    / "models" / "*.keras"
+)
+
+
+def _load_trained_model():
+    """Load the official JEDI-linear checkpoint matching (variant, N).
+
+    Returns the loaded Keras model. Falls back to a freshly-built model only
+    if no checkpoint is found — but emits a loud warning, since the DA cost
+    queries depend on the trained weights to produce realistic estimates.
+    """
+    import keras
+    import hgq  # noqa: F401  registers HGQ custom layers for keras.models.load_model
+
+    if LOAD_TRAINED_WEIGHTS:
+        ckpts = sorted(glob.glob(str(_CHECKPOINT_GLOB)))
+        if ckpts:
+            print(f"Loading trained model: {Path(ckpts[0]).name}")
+            return keras.models.load_model(ckpts[0])
+        print(f"WARN: no checkpoint at {_CHECKPOINT_GLOB} — falling back to fresh weights")
+
+    conf = SimpleNamespace(n_constituents=N_CONSTITUENTS, pt_eta_phi=True)
+    return get_gnn(conf, uq1=USE_PERMINV)
+
+
+model = _load_trained_model()
 g_nnir = build_nn_ir(model, name="jedi_gnn")
 
 print(f"\n{'='*80}")
 print(f"  CMIR EVALUATION — JEDI-linear GNN ({len(model.layers)} Keras layers)")
+print(f"  Variant: {_VARIANT_DIR}, N={N_CONSTITUENTS}, weights={'trained' if LOAD_TRAINED_WEIGHTS else 'fresh'}")
 print(f"  NN-IR: {g_nnir.num_vx} vertices, {g_nnir.num_edges} edges")
-print(f"  Target: VU13P @ {TARGET_FMAX/1e6:.0f} MHz")
+print(f"  Target: VU13P @ {TARGET_FMAX/1e6:.0f} MHz, latency_cutoff={PIPELINE_LATENCY_CUTOFF}")
 print(f"{'='*80}\n")
 
 
@@ -90,6 +132,56 @@ def build_scheduled(K: int) -> HGraph:
     g = sched_p3.steady_state(g, fmax=TARGET_FMAX)
     g = sched_infra.insert_buffers(g)
     return g
+
+
+# --------------------------------------------------------------------------- #
+# End-to-end DA ground truth (K=1 only)
+#
+# The per-layer Sched-IR rollup undercounts because it (a) loses cross-layer
+# bitwidth/quantizer info by collapsing to scalar averages, and (b) doesn't
+# pipeline-register-count compute kernels. For the *fully unfolded* dataflow,
+# da4ml's full-model trace + to_pipeline gives the authoritative cost — it's
+# exactly the path the JEDI-linear paper reports.
+# --------------------------------------------------------------------------- #
+
+def end_to_end_ground_truth() -> dict | None:
+    """Trace the entire model through da4ml and report (LUT, FF, latency).
+
+    Mirrors `JEDI-linear/src/syn_test.py::syn_test_verilog`: trace the model,
+    pipeline at the same latency cutoff, then read `cost` (LUTs) and
+    `reg_bits` (FFs) off the resulting CascadedSolution.
+    """
+    try:
+        from da4ml.converter.hgq2.parser import trace_model
+        from da4ml.trace import comb_trace, HWConfig
+        from da4ml.trace.pipeline import to_pipeline
+    except Exception as e:
+        print(f"  end-to-end ground truth unavailable: {e}")
+        return None
+
+    inp, out = trace_model(model, solver_options={"hard_dc": 2}, hwconf=HWConfig(1, -1, -1))
+    sol = comb_trace(inp, out)
+    pipe = to_pipeline(sol, PIPELINE_LATENCY_CUTOFF, retiming=True, verbose=False)
+
+    lat_min, lat_max = pipe.latency
+    return {
+        "lut": int(round(float(pipe.cost))),
+        "ff": int(pipe.reg_bits),
+        "stages": int(len(pipe.solutions)),
+        "logic_latency_min": float(lat_min),
+        "logic_latency_max": float(lat_max),
+    }
+
+
+GROUND_TRUTH = end_to_end_ground_truth()
+if GROUND_TRUTH is not None:
+    gt = GROUND_TRUTH
+    gt_ns = gt["stages"] * (1e9 / TARGET_FMAX)
+    print(
+        f"  Ground truth (end-to-end DA, K=1):\n"
+        f"    LUT={gt['lut']:,}  FF={gt['ff']:,}  "
+        f"latency={gt['stages']} cyc ({gt_ns:.1f} ns)  II=1\n"
+    )
 
 
 print("Building scheduled graphs...")
@@ -132,7 +224,6 @@ def compute_metrics(g: HGraph, K: int) -> dict:
     m["num_vertices"]       = g.num_vx
     m["num_edges"]          = g.num_edges
     m["makespan"]           = int(_gv(g, "makespan"))
-    m["makespan_ns"]        = m["makespan"] * (1e9 / TARGET_FMAX) if TARGET_FMAX else None
     m["II"]                 = int(_gv(g, "initiation_interval", 1))
     m["pipeline_depth"]     = int(_gv(g, "pipeline_depth"))
     m["throughput_hz"]      = _gv(g, "sustained_throughput_hz")
@@ -145,6 +236,20 @@ def compute_metrics(g: HGraph, K: int) -> dict:
     m["total_dsps"]  = int(_gv(g, "total_dsps"))
     m["total_brams"] = int(_gv(g, "total_brams"))
 
+    # For K=1 (fully unfolded) the per-layer Sched-IR rollup is a lower bound
+    # — it loses the cross-layer bitwidth tracking and pipeline-register
+    # accounting that the end-to-end DA flow performs. Override with the DA
+    # ground truth so the K=1 row matches the JEDI-linear paper.
+    if K == 1 and GROUND_TRUTH is not None:
+        m["total_luts"]     = GROUND_TRUTH["lut"]
+        m["total_ffs"]      = GROUND_TRUTH["ff"]
+        m["makespan"]       = GROUND_TRUTH["stages"]
+        m["pipeline_depth"] = GROUND_TRUTH["stages"]
+        m["batches_in_flight"] = GROUND_TRUTH["stages"]   # II=1 → one batch/stage
+        m["ground_truth"]   = True
+
+    m["makespan_ns"] = m["makespan"] * (1e9 / TARGET_FMAX) if TARGET_FMAX else None
+
     # ---- Infrastructure breakdown ---- #
     compute_luts = 0
     compute_ffs = 0
@@ -155,22 +260,31 @@ def compute_metrics(g: HGraph, K: int) -> dict:
     n_buffers = 0
     n_muxes = 0
 
+    # Multiplier convention (matches Sched-IR/infrastructure.py:_rollup): dense
+    # costs are per-lane and scale with P; reduce/elementwise/buffer/mux costs
+    # cover the full hardware structure and are not replicated.
+    def _mult_for(op: str, inst: int) -> int:
+        if op in ("reduce", "elementwise", "buffer", "mux"):
+            return 1
+        return inst
+
     for vx, p in _vertex_iter(g):
         cost = p.get("cost") or {}
         inst = int(p.get("physical_instances") or 1)
         op = p.get("op", "")
+        mult = _mult_for(op, inst)
 
         if op == "buffer":
             n_buffers += 1
-            buffer_luts  += int(cost.get("lut", 0)) * inst
-            buffer_ffs   += int(cost.get("ff", 0)) * inst
-            buffer_brams += int(cost.get("bram", 0)) * inst
+            buffer_luts  += int(cost.get("lut", 0)) * mult
+            buffer_ffs   += int(cost.get("ff", 0)) * mult
+            buffer_brams += int(cost.get("bram", 0)) * mult
         elif op == "mux":
             n_muxes += 1
-            mux_luts += int(cost.get("lut", 0)) * inst
+            mux_luts += int(cost.get("lut", 0)) * mult
         else:
-            compute_luts += int(cost.get("lut", 0)) * inst
-            compute_ffs  += int(cost.get("ff", 0)) * inst
+            compute_luts += int(cost.get("lut", 0)) * mult
+            compute_ffs  += int(cost.get("ff", 0)) * mult
 
     m["compute_luts"]   = compute_luts
     m["compute_ffs"]    = compute_ffs
@@ -239,10 +353,11 @@ def compute_metrics(g: HGraph, K: int) -> dict:
         op = p.get("op", "unknown")
         cost = p.get("cost") or {}
         inst = int(p.get("physical_instances") or 1)
-        op_costs[op]["lut"]  += int(cost.get("lut", 0)) * inst
-        op_costs[op]["ff"]   += int(cost.get("ff", 0)) * inst
-        op_costs[op]["dsp"]  += int(cost.get("dsp", 0)) * inst
-        op_costs[op]["bram"] += int(cost.get("bram", 0)) * inst
+        mult = _mult_for(op, inst)
+        op_costs[op]["lut"]  += int(cost.get("lut", 0)) * mult
+        op_costs[op]["ff"]   += int(cost.get("ff", 0)) * mult
+        op_costs[op]["dsp"]  += int(cost.get("dsp", 0)) * mult
+        op_costs[op]["bram"] += int(cost.get("bram", 0)) * mult
         op_costs[op]["count"] += 1
     m["op_breakdown"] = dict(op_costs)
 
@@ -447,55 +562,6 @@ for lut, mksp, K in points:
 
 print(f"\n  Pareto-optimal: K ∈ {{{', '.join(str(p[2]) for p in pareto)}}}")
 
-# ASCII Pareto plot
-if len(points) > 1:
-    _header("AREA vs LATENCY (ASCII Plot)")
-    max_lut = max(p[0] for p in points)
-    min_lut = min(p[0] for p in points)
-    max_mksp = max(p[1] for p in points)
-    min_mksp = min(p[1] for p in points)
-
-    PLOT_W = 60
-    PLOT_H = 20
-
-    grid = [[" " for _ in range(PLOT_W)] for _ in range(PLOT_H)]
-
-    # Draw axes
-    for r in range(PLOT_H):
-        grid[r][0] = "│"
-    for c in range(PLOT_W):
-        grid[PLOT_H - 1][c] = "─"
-    grid[PLOT_H - 1][0] = "└"
-
-    # Plot points
-    for lut, mksp, K in points:
-        if max_lut == min_lut:
-            c = PLOT_W // 2
-        else:
-            c = int(1 + (lut - min_lut) / (max_lut - min_lut) * (PLOT_W - 3))
-        if max_mksp == min_mksp:
-            r = PLOT_H // 2
-        else:
-            r = int((1.0 - (mksp - min_mksp) / (max_mksp - min_mksp)) * (PLOT_H - 2))
-        r = max(0, min(r, PLOT_H - 2))
-        c = max(1, min(c, PLOT_W - 1))
-        is_pareto = (lut, mksp, K) in pareto
-        grid[r][c] = "★" if is_pareto else "●"
-        # Label
-        label = f"K={K}"
-        for i, ch in enumerate(label):
-            if c + 1 + i < PLOT_W:
-                grid[r][c + 1 + i] = ch
-
-    # Y-axis label
-    print(f"  Latency (cycles)")
-    print(f"  {max_mksp:>6} ┤")
-    for r in range(PLOT_H):
-        print(f"         {''.join(grid[r])}")
-    print(f"  {min_mksp:>6} ┤{'─' * PLOT_W}")
-    spaces = " " * (PLOT_W - 20)
-    print(f"         {min_lut:<10,}{spaces}{max_lut:>10,}")
-    print(f"         └{'─'*20} Area (LUTs) {'─'*20}┘")
 
 
 # ---- SUMMARY ---- #
@@ -540,6 +606,24 @@ for K, m in all_metrics.items():
 with open(output_path, "w") as f:
     json.dump(serialisable, f, indent=2, default=str)
 print(f"\n  Results saved to: {output_path}")
+
+
+# --------------------------------------------------------------------------- #
+# Matplotlib charts (plot.py is loaded here, after results are persisted, so a
+# plotting failure can't trash a successful sweep).
+# --------------------------------------------------------------------------- #
+
+try:
+    import plot as _plot  # IR/plot.py — added to sys.path at top of file
+
+    plot_dir = HERE / "evaluation_plots"
+    saved = _plot.plot_all({int(K): m for K, m in serialisable.items()}, plot_dir)
+    print(f"\n  Plots saved to: {plot_dir} ({len(saved)} files)")
+    for p in saved:
+        print(f"    - {p.name}")
+except Exception as e:
+    print(f"\n  WARN: plot generation failed: {e}")
+
 
 print(f"\n{'='*80}")
 print(f"  END OF EVALUATION")
