@@ -1,4 +1,4 @@
-# CMIR: Cross-Modal Information Retrieval
+# STAIR - Scheduling and Transport Aware Intermediate Representation
 
 CMIR is a project focused on the analysis, IR (Information Retrieval) generation, and hardware scheduling for Cross-Modal models, specifically targeting the **JEDI-linear** architecture. This repository provides tools to convert Keras models into High-Level IR (NN-IR), decompose them into scheduled primitives (Sched-IR), and estimate hardware costs using `da4ml`.
 
