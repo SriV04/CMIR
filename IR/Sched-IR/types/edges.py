@@ -1,0 +1,42 @@
+from __future__ import annotations
+
+
+def default_edge_properties() -> dict:
+    return {
+        "tensor_shape": None,
+        "edge_kind": "data",
+        "qint": None,
+        "kif": None,
+        "bitwidth": None,
+        "element_bitwidth_bits": None,
+        "element_qint": None,
+        "element_kif": None,
+        "tensor_width_bits": None,
+        "volume_bits": None,
+        "volume_bits_exact": None,
+        "src_qint": None,
+        "src_kif": None,
+        "src_bitwidth_bits": None,
+        "dst_qint": None,
+        "dst_kif": None,
+        "dst_bitwidth_bits": None,
+        "has_quantization_boundary": False,
+        "producer_quantizer": None,
+        "consumer_quantizer": None,
+        "needs_cast": False,
+        "cast_mode": None,
+        "t_produce": None,
+        "t_consume": None,
+        "t_producer": None,
+        "t_consumer": None,
+        "lifetime": None,
+        "fold_iteration": None,
+        "needs_buffer": False,
+        "buffer_kind": None,
+        "buffer_depth": None,
+        "buffer_width_bits": None,
+        "buffer_total_bits": None,
+        "mux_select": None,
+        "mux_input_index": None,
+    }
+

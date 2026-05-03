@@ -182,6 +182,15 @@ def _details_callback(graph, elem):
     return graph_details(graph, elem)
 
 
+def _pretty_print_node_schema(graph, node_id: int) -> None:
+    print(f"[jedi_linear_nn_ir] node {node_id} schema:")
+    pprint.pprint(graph_details(graph, node_id), sort_dicts=False, width=120)
+
+def _pretty_print_edge_schema(graph, edge: tuple[int, int]) -> None:
+    print(f"[jedi_linear_nn_ir] edge {edge} schema:")
+    pprint.pprint(graph_details(graph, edge), sort_dicts=False, width=120)
+
+
 def _load_trained_model():
     import keras
     import hgq  # noqa: F401
@@ -222,6 +231,9 @@ def main() -> None:
     print(f"[jedi_linear_nn_ir] reference architecture layers: {len(expected_model.layers)}")
     print(f"[jedi_linear_nn_ir] nn-ir: {graph.num_vx} vertices, {graph.num_edges} edges")
     print(f"[jedi_linear_nn_ir] model: {model_desc}")
+
+    _pretty_print_node_schema(graph, 1)
+
     if checkpoint is not None:
         print(f"[jedi_linear_nn_ir] checkpoint: {checkpoint.name}")
 
