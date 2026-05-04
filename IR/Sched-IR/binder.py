@@ -7,8 +7,8 @@ Reads the resource YAML, walks an unscheduled Sched-IR graph (produced by
   constraints are satisfied by ``op_params``;
 * writes ``kernel_type`` + a fresh ``kernel_instance`` id;
 * runs the kernel's ``cost_query`` (against the original Keras model for
-  weight access) and stores the canonical
-  ``cost = {lut, ff, dsp, bram, latency_cycles, ii}`` dict.
+  weight access), normalizes it to the full kernel-result shape, and stores
+  both ``cost`` and the richer precision payload on the vertex.
 
 It does **not** touch any folding (`fold_*`) or timing (`t_*`) fields —
 those belong to later phases.
@@ -47,6 +47,7 @@ def _load_sibling(name: str):
 
 _kernels = _load_sibling("kernels")
 _da4ml = _load_sibling("_da4ml")
+_kernel_result = _load_sibling("kernel_result")
 WeightProvider = _kernels.WeightProvider
 REGISTRY: dict[str, Callable[..., dict[str, Any]]] = _kernels.REGISTRY
 
@@ -178,6 +179,56 @@ def _constraints_ok(constraints: dict[str, Any], op_params: dict[str, Any]) -> b
 _NEEDS_BIND = ("dense", "reduce", "elementwise", "activation")
 
 
+def _first_not_none(*vals):
+    for value in vals:
+        if value is not None:
+            return value
+    return None
+
+
+def _sync_result_to_op_params(p: dict, result: dict) -> None:
+    params = p.get("op_params") or {}
+    out_qints = result.get("output_qints")
+    out_kifs = result.get("output_kifs")
+
+    if out_qints:
+        params["output_qint"] = out_qints[0] if len(out_qints) == 1 else out_qints
+    if out_kifs:
+        params["output_kif"] = out_kifs[0] if len(out_kifs) == 1 else out_kifs
+        bits = [int(k["bits"]) for k in out_kifs if k is not None and k.get("bits") is not None]
+        if bits:
+            params["out_bw"] = bits[0] if len(set(bits)) == 1 else max(bits)
+
+
+def _apply_kernel_result(p: dict, result: dict) -> None:
+    p["cost"] = result["cost"]
+    p["kernel_result"] = result
+
+    if result.get("input_qints") is not None:
+        p["input_qints"] = result["input_qints"]
+    if result.get("input_kifs") is not None:
+        p["input_kifs"] = result["input_kifs"]
+    if result.get("output_qints") is not None:
+        p["output_qints"] = result["output_qints"]
+    if result.get("output_kifs") is not None:
+        p["output_kifs"] = result["output_kifs"]
+
+    p["input_tensor_width_bits"] = _first_not_none(
+        result.get("input_tensor_width_bits"),
+        p.get("input_tensor_width_bits"),
+    )
+    p["output_tensor_width_bits"] = _first_not_none(
+        result.get("output_tensor_width_bits"),
+        p.get("output_tensor_width_bits"),
+    )
+    p["precision_source"] = _first_not_none(
+        result.get("precision_source"),
+        p.get("precision_source"),
+        "unknown",
+    )
+    _sync_result_to_op_params(p, result)
+
+
 def bind(
     g_sched: HGraph,
     keras_model,
@@ -212,12 +263,13 @@ def bind(
             raise ValueError(f"resource YAML has no kernel for primitive {prim!r}")
 
         chosen = _select_kernel(p, candidates)
-        cost = chosen.cost_query(p, weights, fpga)
+        raw_result = chosen.cost_query(p, weights, fpga)
+        result = _kernel_result.normalize_kernel_result(raw_result, source="closed_form")
 
         p["kernel_type"]     = chosen.name
         p["kernel_instance"] = next_instance.setdefault(chosen.name, 0)
         next_instance[chosen.name] += 1
-        p["cost"]            = cost
+        _apply_kernel_result(p, result)
 
     _validate_bind(g_sched)
     return g_sched
@@ -246,3 +298,5 @@ def _validate_bind(g_sched: HGraph) -> None:
         missing = [k for k in _REQUIRED_COST_KEYS if k not in cost]
         if missing:
             raise ValueError(f"BIND vertex {vx} cost dict missing keys: {missing}")
+        if p.get("kernel_result") is None:
+            raise ValueError(f"BIND left vertex {vx} without kernel_result metadata")

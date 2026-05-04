@@ -2,15 +2,14 @@
 
 Each function in this module is a `cost_query` named in
 `da4ml-resource.yaml`. Given a Sched-IR vertex pmap and a `WeightProvider`,
-it returns the canonical cost dict
-``{lut, ff, dsp, bram, latency_cycles, ii}`` that the BIND pass writes onto
-the vertex.
+it returns either a full kernel-result payload or a legacy canonical cost
+dict ``{lut, ff, dsp, bram, latency_cycles, ii}``.
 
 Cost queries fall into two groups:
 
 1. **da4ml-driven** (`da4ml_*_cost`): build a tiny da4ml trace from the
    Sched-IR `op_params`, run `comb_trace` (or `cmvm.api.solve` for dense),
-   read `.cost` / `.latency` back out via `_da4ml.to_cost_dict`.
+   and return the full `_da4ml.*_result(...)` payload.
 2. **Closed-form** (`register_buffer_cost`, `bram_buffer_cost`,
    `lut_mux_cost`): scheduler-inserted infrastructure with no da4ml
    involvement.
@@ -80,32 +79,83 @@ class WeightProvider:
 # da4ml-driven cost queries
 # --------------------------------------------------------------------------- #
 
+def _first_not_none(*vals):
+    for value in vals:
+        if value is not None:
+            return value
+    return None
+
+
+def _as_2d_kernel(kernel) -> np.ndarray:
+    kernel = np.asarray(kernel)
+    if kernel.ndim != 2:
+        kernel = kernel.reshape(-1, kernel.shape[-1])
+    return kernel
+
+
+def _single_input_precision_kwargs(op_params: dict) -> dict[str, Any]:
+    return {
+        "input_qints": [op_params.get("input_qint")],
+        "input_kifs": [op_params.get("input_kif")],
+        "input_bws": [float(op_params.get("in_bw"))] if op_params.get("in_bw") is not None else None,
+    }
+
+
+def _input_qints_for_kernel(op_params: dict, kernel: np.ndarray):
+    qints = _da4ml.qints_from_precision_payload(
+        op_params.get("input_qint"),
+        op_params.get("input_kif"),
+        fallback_bw=op_params.get("in_bw"),
+    )
+
+    if isinstance(qints, list):
+        if len(qints) == 1:
+            return qints * kernel.shape[0]
+        if len(qints) == kernel.shape[0]:
+            return qints
+        if len(qints) == kernel.size:
+            raise ValueError(
+                f"dense vertex {op_params.get('layer_name')!r}: got elementwise input precision "
+                f"({len(qints)} qints) where per-input-feature precision ({kernel.shape[0]}) was required"
+            )
+        raise ValueError(
+            f"dense vertex {op_params.get('layer_name')!r}: expected 1 or {kernel.shape[0]} input qints, got {len(qints)}"
+        )
+
+    if qints is not None:
+        return [qints] * kernel.shape[0]
+
+    raise ValueError("dense has no input precision")
+
 def da4ml_dense_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
     op_params = p.get("op_params") or {}
-    in_bw = op_params.get("in_bw")
-    if in_bw is None:
-        raise ValueError(f"dense vertex {p.get('nn_layer_name')!r} has no in_bw")
-
-    kernel = weights.get_kernel(p["nn_layer_name"])
+    kernel = _first_not_none(
+        op_params.get("qkernel_values"),
+        op_params.get("kernel_values"),
+        weights.get_kernel(p["nn_layer_name"]),
+    )
     if kernel is None:
         raise ValueError(
             f"dense vertex {p['nn_layer_name']!r}: no constant kernel found on the Keras model"
         )
 
-    # Collapse higher-rank kernels (e.g. (M, K, N)) to a 2-D (in_features,
-    # out_features) view by flattening leading dims into the input axis.
-    # JEDI-linear kernels are already 2-D so this is a no-op there.
-    if kernel.ndim != 2:
-        kernel = kernel.reshape(-1, kernel.shape[-1])
+    kernel = _as_2d_kernel(kernel)
+    input_qints = _input_qints_for_kernel(op_params, kernel)
 
-    in_qint = _da4ml.qint_from_bw(in_bw)
-    return _da4ml.solve_dense(
+    result = _da4ml.solve_dense_result(
         kernel,
-        in_qint,
+        input_qints=input_qints,
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
         latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
+    result["kernel_meta"] = {
+        "op": "dense",
+        "kernel_shape": tuple(kernel.shape),
+        "uses_qkernel": bool(op_params.get("uses_qkernel")),
+        "kernel_sparsity": op_params.get("kernel_sparsity"),
+    }
+    return result
 
 
 def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
@@ -139,14 +189,22 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     else:
         raise NotImplementedError(f"reduce mode {mode!r} not supported")
 
-    return _da4ml.trace_lambda(
+    result = _da4ml.trace_lambda_result(
         [trace_shape],
-        [float(in_bw)],
         body,
+        **_single_input_precision_kwargs(op_params),
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
         latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
+    result["kernel_meta"] = {
+        "op": "reduce",
+        "mode": mode,
+        "axes": axes,
+        "reduction_width": op_params.get("reduction_width"),
+        "reduce_mode": op_params.get("reduce_mode") or p.get("reduce_mode") or "spatial",
+    }
+    return result
 
 
 def da4ml_elementwise_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:
@@ -176,14 +234,22 @@ def da4ml_elementwise_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict
     else:
         raise NotImplementedError(f"elementwise op {op!r} not supported")
 
-    return _da4ml.trace_lambda(
+    result = _da4ml.trace_lambda_result(
         trace_shapes,
-        [float(b) for b in in_bws],
         body,
+        input_qints=op_params.get("input_qints"),
+        input_kifs=op_params.get("input_kifs"),
+        input_bws=[float(b) for b in in_bws] if in_bws else None,
         adder_size=int(fpga.get("adder_size", -1)),
         carry_size=int(fpga.get("carry_size", -1)),
         latency_cutoff=int(fpga.get("latency_cutoff", -1)),
     )
+    result["kernel_meta"] = {
+        "op": "elementwise",
+        "elementwise_op": op,
+        "n_inputs": len(trace_shapes),
+    }
+    return result
 
 
 def _broadcast_reduce(arrays, binop):
@@ -306,7 +372,13 @@ def da4ml_activation_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[
     in_bw = op_params.get("in_bw")
 
     if func in ("linear", None):
-        return _da4ml.to_cost_dict(0.0, (0.0, 0.0))
+        return _da4ml.legacy_cost_to_result(
+            0.0,
+            (0.0, 0.0),
+            output_qints=[op_params.get("input_qint")] if op_params.get("input_qint") is not None else None,
+            output_kifs=[op_params.get("input_kif")] if op_params.get("input_kif") is not None else None,
+            precision_source="inherited",
+        )
 
     if in_shape is None or in_bw is None:
         raise ValueError(
@@ -317,14 +389,20 @@ def da4ml_activation_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[
 
     if func == "relu":
         body = lambda x: _da4ml.relu(x)  # noqa: E731
-        return _da4ml.trace_lambda(
+        result = _da4ml.trace_lambda_result(
             [trace_shape],
-            [float(in_bw)],
             body,
+            **_single_input_precision_kwargs(op_params),
             adder_size=int(fpga.get("adder_size", -1)),
             carry_size=int(fpga.get("carry_size", -1)),
             latency_cutoff=int(fpga.get("latency_cutoff", -1)),
         )
+        result["kernel_meta"] = {
+            "op": "activation",
+            "func": func,
+            "implementation": op_params.get("implementation"),
+        }
+        return result
 
     # TODO: route sigmoid/tanh/softmax through a LUT-based estimator. For
     # now flag it loudly so we notice the day a non-ReLU activation appears.

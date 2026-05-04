@@ -28,6 +28,7 @@ def default_node_properties() -> dict:
         "kernel_type": None,
         "kernel_instance": None,
         "cost": None,
+        "kernel_result": None,
         "reduce_mode": None,
         "schema_version": 2,
         "schema_notes": None,
@@ -35,4 +36,3 @@ def default_node_properties() -> dict:
     base.update(_precision.default_precision_interface())
     base.update(_schedule.default_timing_fields())
     return base
-

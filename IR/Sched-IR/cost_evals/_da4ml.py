@@ -65,11 +65,21 @@ def _require():
 def qint_to_dict(qint) -> dict | None:
     if qint is None:
         return None
-    return {
-        "min": float(qint.min),
-        "max": float(qint.max),
-        "step": float(qint.step),
-    }
+    if isinstance(qint, dict):
+        return qint
+    try:
+        return {
+            "min": float(qint.min),
+            "max": float(qint.max),
+            "step": float(qint.step),
+        }
+    except AttributeError:
+        low, high, step = qint
+        return {
+            "min": float(low),
+            "max": float(high),
+            "step": float(step),
+        }
 
 
 def qints_to_dicts(qints) -> list[dict] | None:
@@ -81,6 +91,18 @@ def qints_to_dicts(qints) -> list[dict] | None:
 def kif_to_dict(kif) -> dict | None:
     if kif is None:
         return None
+    if isinstance(kif, dict):
+        if all(np.isscalar(kif.get(x)) for x in ("k", "i", "f")):
+            k = bool(kif["k"])
+            i = int(kif["i"])
+            f = int(kif["f"])
+            return {
+                "k": k,
+                "i": i,
+                "f": f,
+                "bits": int(k) + i + f,
+            }
+        raise ValueError("array-valued KIF dict must be flattened before kif_to_dict")
     if hasattr(kif, "keep_negative"):
         k = bool(kif.keep_negative)
         i = int(kif.integers)
@@ -98,9 +120,24 @@ def kif_to_dict(kif) -> dict | None:
     }
 
 
+def flatten_kif_dict(kif: dict) -> list[dict]:
+    k = np.asarray(kif["k"])
+    i = np.asarray(kif["i"])
+    f = np.asarray(kif["f"])
+    k, i, f = np.broadcast_arrays(k, i, f)
+    return [
+        kif_to_dict({"k": kk, "i": ii, "f": ff})
+        for kk, ii, ff in zip(k.ravel(), i.ravel(), f.ravel())
+    ]
+
+
 def kifs_payload_to_dicts(kifs) -> list[dict] | None:
     if kifs is None:
         return None
+    if isinstance(kifs, dict):
+        if any(np.asarray(kifs.get(x)).ndim > 0 for x in ("k", "i", "f")):
+            return flatten_kif_dict(kifs)
+        return [kif_to_dict(kifs)]
     if isinstance(kifs, (list, tuple)):
         if kifs and isinstance(kifs[0], (list, tuple)) and len(kifs[0]) == 3:
             return [kif_to_dict(tuple(kif)) for kif in kifs]
@@ -126,6 +163,8 @@ def kifs_payload_to_dicts(kifs) -> list[dict] | None:
 def qint_from_dict(obj):
     if obj is None:
         return None
+    if not isinstance(obj, dict):
+        return obj
     _require()
     return QInterval(float(obj["min"]), float(obj["max"]), float(obj["step"]))  # type: ignore[union-attr]
 
@@ -134,43 +173,46 @@ def qint_from_kif_dict(kif):
     if kif is None:
         return None
     _require()
-    return QInterval.from_kif(bool(kif["k"]), int(kif["i"]), int(kif["f"]))  # type: ignore[union-attr]
+    return QInterval.from_kif(int(bool(kif["k"])), int(kif["i"]), int(kif["f"]))  # type: ignore[union-attr]
+
+
+def _shape_size(shape: tuple[int, ...] | None) -> int | None:
+    if shape is None:
+        return None
+    dims = [dim for dim in shape if dim is not None]
+    if len(dims) != len(shape):
+        return None
+    return int(np.prod(dims)) if dims else 1
 
 
 def qints_from_precision_payload(qint_payload, kif_payload=None, fallback_bw=None, shape=None):
     """Coerce qint/kif/bitwidth payloads into QInterval values.
 
     Priority: explicit qint payload, then kif payload, then scalar bw fallback.
-    If `shape` is provided, scalar precision payloads are broadcast to the
-    element count implied by the shape.
+    Scalar payloads stay scalar. Array/list payloads stay explicit.
     """
-    size = None
-    if shape is not None:
-        size = int(np.prod(shape)) if len(shape) else 1
-
-    def _broadcast(val):
-        if size is None:
-            return val
-        return [val] * size
-
+    _ = shape
     if qint_payload is not None:
         if isinstance(qint_payload, dict):
-            return _broadcast(qint_from_dict(qint_payload))
+            qint_keys = {"min", "max", "step"}
+            if qint_keys.issubset(qint_payload.keys()):
+                return qint_from_dict(qint_payload)
+            raise ValueError("array-valued qint dicts are not supported; flatten before coercion")
         if isinstance(qint_payload, (list, tuple)):
-            if qint_payload and isinstance(qint_payload[0], dict):
-                return [qint_from_dict(q) for q in qint_payload]
-            return list(qint_payload)
-        return _broadcast(qint_payload)
+            return [qint_from_dict(q) for q in qint_payload]
+        if isinstance(qint_payload, np.ndarray):
+            return [qint_from_dict(q) for q in np.ravel(qint_payload).tolist()]
+        return qint_from_dict(qint_payload)
 
     if kif_payload is not None:
-        if isinstance(kif_payload, dict):
-            return _broadcast(qint_from_kif_dict(kif_payload))
         kifs = kifs_payload_to_dicts(kif_payload)
         if kifs is not None:
+            if len(kifs) == 1:
+                return qint_from_kif_dict(kifs[0])
             return [qint_from_kif_dict(kif) for kif in kifs]
 
     if fallback_bw is not None:
-        return _broadcast(qint_from_bw(fallback_bw))
+        return qint_from_bw(fallback_bw)
     return None
 
 def qint_from_bw(bw: float | int, signed: bool = True) -> "QInterval":
@@ -201,16 +243,17 @@ def make_input_array(shape: tuple[int, ...], bw: float, *, signed: bool = True,
     k_arr = np.full(shape, 1 if signed else 0, dtype=np.int8)
     i_arr = np.full(shape, max(bw_int - (1 if signed else 0), 0), dtype=np.int32)
     f_arr = np.zeros(shape, dtype=np.int32)
-    return FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hw or hwconf())  # type: ignore[union-attr]
+    return FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hwconf=hw or hwconf())  # type: ignore[union-attr]
 
 
 def make_input_array_from_qint(shape: tuple[int, ...], qint, *, hw: "HWConfig | None" = None) -> "FixedVariableArray":
     _require()
     qint = qint_from_dict(qint) if isinstance(qint, dict) else qint
-    low = np.full(shape, float(qint.min), dtype=np.float64)
-    high = np.full(shape, float(qint.max), dtype=np.float64)
-    step = np.full(shape, float(qint.step), dtype=np.float64)
-    return FixedVariableArray.from_lhs(low, high, step, hw or hwconf())  # type: ignore[union-attr]
+    qdict = qint_to_dict(qint)
+    low = np.full(shape, float(qdict["min"]), dtype=np.float64)
+    high = np.full(shape, float(qdict["max"]), dtype=np.float64)
+    step = np.full(shape, float(qdict["step"]), dtype=np.float64)
+    return FixedVariableArray.from_lhs(low, high, step, hwconf=hw or hwconf())  # type: ignore[union-attr]
 
 
 def make_input_array_from_kif(shape: tuple[int, ...], kif, *, hw: "HWConfig | None" = None) -> "FixedVariableArray":
@@ -219,7 +262,7 @@ def make_input_array_from_kif(shape: tuple[int, ...], kif, *, hw: "HWConfig | No
     k_arr = np.full(shape, int(bool(kif["k"])), dtype=np.int8)
     i_arr = np.full(shape, int(kif["i"]), dtype=np.int32)
     f_arr = np.full(shape, int(kif["f"]), dtype=np.int32)
-    return FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hw or hwconf())  # type: ignore[union-attr]
+    return FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hwconf=hw or hwconf())  # type: ignore[union-attr]
 
 
 # --------------------------------------------------------------------------- #
@@ -405,10 +448,19 @@ def solution_to_result(sol, latency_cutoff: int = -1) -> dict[str, Any]:
         }
     )
 
-    input_qints = qints_to_dicts(getattr(pipe, "inp_qint", None))
-    output_qints = qints_to_dicts(getattr(pipe, "out_qint", None))
-    input_kifs = kifs_payload_to_dicts([q.precision for q in getattr(pipe, "inp_qint", [])]) if getattr(pipe, "inp_qint", None) is not None else None
-    output_kifs = kifs_payload_to_dicts([q.precision for q in getattr(pipe, "out_qint", [])]) if getattr(pipe, "out_qint", None) is not None else None
+    raw_input_qints = getattr(pipe, "inp_qint", None)
+    raw_output_qints = getattr(pipe, "out_qint", None)
+    input_qints = qints_to_dicts(raw_input_qints)
+    output_qints = qints_to_dicts(raw_output_qints)
+
+    raw_input_kifs = getattr(pipe, "inp_kifs", None)
+    raw_output_kifs = getattr(pipe, "out_kifs", None)
+    if raw_input_kifs is None and raw_input_qints is not None:
+        raw_input_kifs = [getattr(q, "precision", None) for q in raw_input_qints]
+    if raw_output_kifs is None and raw_output_qints is not None:
+        raw_output_kifs = [getattr(q, "precision", None) for q in raw_output_qints]
+    input_kifs = kifs_payload_to_dicts(raw_input_kifs)
+    output_kifs = kifs_payload_to_dicts(raw_output_kifs)
 
     result["input_qints"] = input_qints
     result["output_qints"] = output_qints
@@ -419,10 +471,13 @@ def solution_to_result(sol, latency_cutoff: int = -1) -> dict[str, Any]:
     result["input_tensor_width_bits"] = sum(result["input_bitwidths"]) if result["input_bitwidths"] else None
     result["output_tensor_width_bits"] = sum(result["output_bitwidths"]) if result["output_bitwidths"] else None
     result["precision_source"] = "da4ml"
+    n_inputs = len(input_qints) if input_qints else len(input_kifs) if input_kifs else None
+    n_outputs = len(output_qints) if output_qints else len(output_kifs) if output_kifs else None
     result["da4ml"] = {
         "solution_type": type(pipe).__name__,
-        "n_inputs": pipe.shape[0] if hasattr(pipe, "shape") else None,
-        "n_outputs": pipe.shape[1] if hasattr(pipe, "shape") else None,
+        "n_inputs": n_inputs,
+        "n_outputs": n_outputs,
+        "shape": tuple(pipe.shape) if hasattr(pipe, "shape") else None,
         "latency": tuple(map(float, pipe.latency)) if hasattr(pipe, "latency") else None,
         "out_latency": list(map(float, pipe.out_latencies)) if hasattr(pipe, "out_latencies") else None,
         "reg_bits": reg_bits,
@@ -456,14 +511,22 @@ def to_cost_dict(da4ml_cost: float, da4ml_latency: tuple[float, float] | float |
     return cost
 
 
-def legacy_cost_to_result(da4ml_cost: float, da4ml_latency: tuple[float, float] | float | None, *, output_qints=None, output_kifs=None):
+def legacy_cost_to_result(
+    da4ml_cost: float,
+    da4ml_latency: tuple[float, float] | float | None,
+    *,
+    output_qints=None,
+    output_kifs=None,
+    precision_source: str | None = None,
+):
     result = empty_kernel_result()
     result["cost"] = to_cost_dict(da4ml_cost, da4ml_latency)
     result["output_qints"] = output_qints
     result["output_kifs"] = output_kifs
     result["output_bitwidths"] = [k["bits"] for k in output_kifs] if output_kifs else None
     result["output_tensor_width_bits"] = sum(result["output_bitwidths"]) if result["output_bitwidths"] else None
-    result["precision_source"] = "derived" if (output_qints or output_kifs) else "unknown"
+    result["precision_source"] = precision_source or ("derived" if (output_qints or output_kifs) else "unknown")
+    _validate_kernel_result(result)
     return result
 
 
@@ -550,15 +613,24 @@ def trace_lambda_result(
         bw_payload = input_bws[idx] if input_bws is not None else None
 
         if qint_payload is not None:
-            qints = qints_from_precision_payload(qint_payload, shape=shape)
-            if isinstance(qints, list) and len(qints) == 1:
-                inputs.append(make_input_array_from_qint(shape, qints[0], hw=hw))
+            qints = qints_from_precision_payload(qint_payload)
+            if not isinstance(qints, list):
+                inputs.append(make_input_array_from_qint(shape, qints, hw=hw))
             else:
-                qints = np.array([qint_to_dict(q) if not isinstance(q, dict) else q for q in qints], dtype=object).reshape(shape)
-                low = np.vectorize(lambda d: float(d["min"]))(qints)
-                high = np.vectorize(lambda d: float(d["max"]))(qints)
-                step = np.vectorize(lambda d: float(d["step"]))(qints)
-                inputs.append(FixedVariableArray.from_lhs(low, high, step, hw))  # type: ignore[union-attr]
+                expected = _shape_size(shape)
+                if expected is None:
+                    raise ValueError(
+                        f"input {idx}: per-element qints require a fully concrete shape, got {shape}"
+                    )
+                if len(qints) != expected:
+                    raise ValueError(
+                        f"input {idx}: got {len(qints)} qints for shape {shape}, expected {expected}"
+                    )
+                qints_arr = np.array([qint_to_dict(q) for q in qints], dtype=object).reshape(shape)
+                low = np.vectorize(lambda d: float(d["min"]))(qints_arr)
+                high = np.vectorize(lambda d: float(d["max"]))(qints_arr)
+                step = np.vectorize(lambda d: float(d["step"]))(qints_arr)
+                inputs.append(FixedVariableArray.from_lhs(low, high, step, hwconf=hw))  # type: ignore[union-attr]
         elif kif_payload is not None:
             kifs = kifs_payload_to_dicts(kif_payload)
             if kifs is not None and len(kifs) == 1:
@@ -566,11 +638,20 @@ def trace_lambda_result(
             else:
                 if kifs is None:
                     raise ValueError("input_kifs payload could not be converted")
+                expected = _shape_size(shape)
+                if expected is None:
+                    raise ValueError(
+                        f"input {idx}: per-element kifs require a fully concrete shape, got {shape}"
+                    )
+                if len(kifs) != expected:
+                    raise ValueError(
+                        f"input {idx}: got {len(kifs)} kifs for shape {shape}, expected {expected}"
+                    )
                 kifs_arr = np.array(kifs, dtype=object).reshape(shape)
                 k_arr = np.vectorize(lambda d: int(bool(d["k"])))(kifs_arr)
                 i_arr = np.vectorize(lambda d: int(d["i"]))(kifs_arr)
                 f_arr = np.vectorize(lambda d: int(d["f"]))(kifs_arr)
-                inputs.append(FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hw))  # type: ignore[union-attr]
+                inputs.append(FixedVariableArray.from_kif(k_arr, i_arr, f_arr, hwconf=hw))  # type: ignore[union-attr]
         elif input_bws is not None:
             inputs.append(make_input_array(shape, bw_payload, hw=hw))
         else:
