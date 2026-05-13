@@ -170,44 +170,27 @@ def _reduce_consumes_fold_axis(p: dict, fold_axes: list[int] | None) -> bool:
 # Public entry point
 # --------------------------------------------------------------------------- #
 
-def fold(
+def stamp_fold_plan(
     g_sched: HGraph,
     *,
     factor: int | None = None,
     lanes: int | None = None,
 ) -> HGraph:
-    """Phase 2 — apply an N–P–T folding policy to every fold group.
+    """Phase 2a — stamp fold groups + (N, P, T) and reduction mode.
 
-    The policy can be expressed in two equivalent ways:
+    This pass is intentionally *cost-free*: it does not read/modify `p["cost"]`
+    and does not populate timing fields that depend on intrinsic kernel depth.
 
-    * ``factor`` — the legacy parameter: interpreted as the *requested*
-      temporal-step count T. Per-group we derive P = ceil(N / factor), then
-      snap T := ceil(N / P) so the invariant T == ceil(N / P) always holds.
-    * ``lanes``  — directly specifies P, and T is derived.
+    It exists to support a fold-first flow:
 
-    Exactly one of the two must be given. ``factor=1`` (or ``lanes=N``) is a
-    valid no-op call: every vertex is labelled with T=1, P=N, ``ii=1``, and
-    reduction modes stay ``'spatial'`` — useful for the baseline pass.
+        decompose -> stamp_fold_plan -> bind/precision-propagate -> apply_timing -> schedule
     """
     if (factor is None) == (lanes is None):
-        raise ValueError("fold(...) requires exactly one of factor= or lanes=")
+        raise ValueError("stamp_fold_plan(...) requires exactly one of factor= or lanes=")
     if factor is not None and factor < 1:
         raise ValueError(f"fold factor must be >= 1, got {factor}")
     if lanes is not None and lanes < 1:
         raise ValueError(f"fold lanes must be >= 1, got {lanes}")
-
-    # BIND caches the *resolved* fpga config on the graph (with `latency_cutoff:
-    # auto` already turned into an integer). Prefer that; fall back to
-    # re-loading + re-normalising the YAML if BIND didn't run for some reason.
-    fpga = g_sched.pmap.get("fpga_config")
-    if not fpga:
-        yaml_path = g_sched.pmap.get("resource_yaml")
-        if yaml_path is None:
-            raise ValueError("fold() requires bind() to have run first (no resource_yaml on the graph)")
-        cfg = yaml.safe_load(Path(yaml_path).read_text())
-        # Use the same normaliser BIND uses, loaded via importlib (sibling dir).
-        binder = _load_sibling("binder")
-        fpga = binder.normalize_fpga(cfg.get("fpga") or {})
 
     # ---------------------------------------------------------------- #
     # 1. Build fold groups via union-find over constraint edges
@@ -224,7 +207,6 @@ def fold(
             in_any_group.add(v)
 
     raw_groups = uf.groups()
-    # Strip singletons that aren't actually in any constraint.
     groups: dict[int, list[int]] = {}
     next_gid = 0
     for members in raw_groups.values():
@@ -245,9 +227,6 @@ def fold(
         if not N:
             continue
 
-        # Resolve P (hardware lanes) from the folding policy, then snap
-        # T := ceil(N / P) so the invariant T == ceil(N / P) holds even
-        # when the user picks a T that doesn't divide N.
         if lanes is not None:
             P = max(1, min(int(lanes), int(N)))
         else:
@@ -255,7 +234,6 @@ def fold(
             P = max(1, math.ceil(int(N) / T_req))
         T = max(1, math.ceil(int(N) / P))
 
-        # Group-level fold_axes = intersection of every member's fold_axes.
         common_axes: set[int] | None = None
         for m in members:
             ma = set(g_sched.pmap[m].get("fold_axes") or [])
@@ -270,9 +248,9 @@ def fold(
         info = {
             "group_id": gid,
             "axes": common_axes_list,
-            "parallelism": int(N),          # N
-            "lanes": int(P),                # P
-            "temporal_steps": int(T),       # T = ceil(N / P)
+            "parallelism": int(N),
+            "lanes": int(P),
+            "temporal_steps": int(T),
             "factor": int(T),               # legacy alias for T
             "physical_instances": int(P),   # legacy alias for P
             "members": members,
@@ -283,46 +261,90 @@ def fold(
             group_info_by_member[m] = info
 
     # ---------------------------------------------------------------- #
-    # 3. Apply N–P–T timing to vertices
+    # 3. Stamp group identity + reduction modes
     # ---------------------------------------------------------------- #
     for vx in g_sched.vertices:
         p = g_sched.pmap[vx]
-
         if p.get("op") in ("buffer", "mux"):
-            # Scheduler-inserted infrastructure is not a compute node —
-            # leave it to infrastructure.py to set timing on.
             continue
 
         info = group_info_by_member.get(vx)
-
         if info is None:
-            # Outside any fold group: trivially N=P=T=1.
-            _apply_timing(p, N=1, P=1, T=1, group_id=None)
+            p["parallelism_N"] = 1
+            p["lanes_P"] = 1
+            p["temporal_steps_T"] = 1
+            p["fold_factor"] = 1
+            p["physical_instances"] = 1
+            p["fold_group"] = None
+            if p.get("op") == "reduce":
+                p["reduce_mode"] = "spatial"
             continue
 
-        N = info["parallelism"]
-        P = info["lanes"]
-        T = info["temporal_steps"]
+        p["parallelism_N"] = int(info["parallelism"])
+        p["lanes_P"] = int(info["lanes"])
+        p["temporal_steps_T"] = int(info["temporal_steps"])
+        p["fold_factor"] = int(info["temporal_steps"])
+        p["physical_instances"] = int(info["lanes"])
+        p["fold_group"] = int(info["group_id"])
 
-        # Reductions consuming the fold axis: recompute cost for the
-        # spatial/temporal layout dictated by (N, P, T), then flip mode.
-        if vx in info["reductions_temporalised"] and T > 1:
-            new_cost = _kernels.da4ml_reduce_temporal_cost(
-                p, _NoWeights(), fpga,
-                parallelism=N,
-                factor=T,
-            )
-            p["cost"] = new_cost
-            p["reduce_mode"] = "temporal_accumulate" if P == 1 else "hybrid"
+        if p.get("op") == "reduce":
+            T = int(info["temporal_steps"])
+            P = int(info["lanes"])
+            if vx in info["reductions_temporalised"] and T > 1:
+                p["reduce_mode"] = "temporal_accumulate" if P == 1 else "hybrid"
+            else:
+                p["reduce_mode"] = "spatial"
 
-        _apply_timing(p, N=N, P=P, T=T, group_id=info["group_id"])
-
-    # ---------------------------------------------------------------- #
-    # 4. Stamp the graph-level fold plan
-    # ---------------------------------------------------------------- #
     g_sched.pmap["fold_plan"] = fold_plan
+    return g_sched
+
+
+def apply_timing_from_costs(g_sched: HGraph) -> HGraph:
+    """Phase 2b — write timing fields that depend on intrinsic kernel latency.
+
+    Requires that `parallelism_N/lanes_P/temporal_steps_T` have already been
+    stamped (e.g. by `stamp_fold_plan`) and `p["cost"]` exists for compute nodes.
+    """
+    for vx in g_sched.vertices:
+        p = g_sched.pmap[vx]
+        if p.get("op") in ("buffer", "mux"):
+            continue
+
+        N = int(p.get("parallelism_N") or 1)
+        P = int(p.get("lanes_P") or 1)
+        T = int(p.get("temporal_steps_T") or 1)
+        group_id = p.get("fold_group")
+        _apply_timing(p, N=N, P=P, T=T, group_id=group_id)
 
     _validate_fold(g_sched)
+    return g_sched
+
+
+def fold(
+    g_sched: HGraph,
+    *,
+    factor: int | None = None,
+    lanes: int | None = None,
+) -> HGraph:
+    """Phase 2 — apply an N–P–T folding policy to every fold group.
+
+    The policy can be expressed in two equivalent ways:
+
+    * ``factor`` — the legacy parameter: interpreted as the *requested*
+      temporal-step count T. Per-group we derive P = ceil(N / factor), then
+      snap T := ceil(N / P) so the invariant T == ceil(N / P) always holds.
+    * ``lanes``  — directly specifies P, and T is derived.
+
+    Exactly one of the two must be given. ``factor=1`` (or ``lanes=N``) is a
+    valid no-op call: every vertex is labelled with T=1, P=N, ``ii=1``, and
+    reduction modes stay ``'spatial'`` — useful for the baseline pass.
+    """
+    # Back-compat: preserve the old "bind -> fold" call pattern.
+    #
+    # Newer flows should prefer:
+    #   stamp_fold_plan(...) -> bind_and_propagate(...) -> apply_timing_from_costs(...)
+    stamp_fold_plan(g_sched, factor=factor, lanes=lanes)
+    apply_timing_from_costs(g_sched)
     return g_sched
 
 

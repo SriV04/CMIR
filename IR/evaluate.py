@@ -124,10 +124,11 @@ FOLD_FACTORS = [1, 2, 4, 8]
 
 
 def build_scheduled(K: int) -> HGraph:
-    """Decompose → Bind → Fold(K) → Schedule → Steady_state → Insert_buffers."""
+    """Decompose → Fold-plan(K) → Bind+Propagate → Timing → Schedule → Steady_state → Insert_buffers."""
     g = sched_decomp.decompose_nn_to_sched(g_nnir)
-    g = sched_engine.bind(g, model, RESOURCE_YAML)
-    g = sched_folder.fold(g, factor=K)
+    g = sched_folder.stamp_fold_plan(g, factor=K)
+    g = sched_engine.bind_and_propagate(g, model, RESOURCE_YAML)
+    g = sched_folder.apply_timing_from_costs(g)
     g = sched_p3.schedule(g)
     g = sched_p3.steady_state(g, fmax=TARGET_FMAX)
     g = sched_infra.insert_buffers(g)

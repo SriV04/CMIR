@@ -193,6 +193,10 @@ def qints_from_precision_payload(qint_payload, kif_payload=None, fallback_bw=Non
     """
     _ = shape
     if qint_payload is not None:
+        # da4ml's `QInterval` is tuple-like (iterable) in some versions, so
+        # detect it *before* treating tuples/lists as per-element payloads.
+        if QInterval is not None and isinstance(qint_payload, QInterval):  # type: ignore[arg-type]
+            return qint_payload
         if isinstance(qint_payload, dict):
             qint_keys = {"min", "max", "step"}
             if qint_keys.issubset(qint_payload.keys()):

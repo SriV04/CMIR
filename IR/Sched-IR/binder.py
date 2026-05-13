@@ -275,6 +275,148 @@ def bind(
     return g_sched
 
 
+def _topo_order(g: HGraph) -> list[int]:
+    indeg = {v: len(g.in_vx(v)) for v in g.vertices}
+    queue = [v for v, d in indeg.items() if d == 0]
+    order: list[int] = []
+    head = 0
+    while head < len(queue):
+        v = queue[head]
+        head += 1
+        order.append(v)
+        for u in g.out_vx(v):
+            indeg[u] -= 1
+            if indeg[u] == 0:
+                queue.append(u)
+    if len(order) != len(g.vertices):
+        raise ValueError("Sched-IR graph is cyclic; cannot topologically bind/propagate")
+    return order
+
+
+def _edge_input_precision(ep: dict) -> tuple[Any | None, Any | None, Any | None]:
+    qint = _first_not_none(ep.get("src_qint"), ep.get("element_qint"), ep.get("dst_qint"), ep.get("qint"))
+    kif = _first_not_none(ep.get("src_kif"), ep.get("element_kif"), ep.get("dst_kif"), ep.get("kif"))
+    width = _first_not_none(ep.get("tensor_width_bits"), ep.get("volume_bits_exact"), ep.get("volume_bits"))
+    return qint, kif, width
+
+
+def _ingest_inputs_from_edges(g: HGraph, vx: int) -> None:
+    p = g.pmap[vx]
+    preds = g.in_vx(vx)
+    if not preds:
+        return
+
+    in_qints = []
+    in_kifs = []
+    in_widths = []
+    for u in preds:
+        ep = g.pmap[(u, vx)]
+        qint, kif, width = _edge_input_precision(ep)
+        in_qints.append(qint)
+        in_kifs.append(kif)
+        in_widths.append(width)
+
+    if any(x is not None for x in in_qints):
+        p["input_qints"] = in_qints
+    if any(x is not None for x in in_kifs):
+        p["input_kifs"] = in_kifs
+    if any(x is not None for x in in_widths):
+        p["input_tensor_width_bits"] = in_widths
+
+    params = p.get("op_params") or {}
+    op = p.get("op")
+    if op == "elementwise":
+        params["input_qints"] = p.get("input_qints")
+        params["input_kifs"] = p.get("input_kifs")
+    elif op in ("dense", "reduce", "activation"):
+        if p.get("input_qints"):
+            params["input_qint"] = p["input_qints"][0]
+        if p.get("input_kifs"):
+            params["input_kif"] = p["input_kifs"][0]
+
+
+def _propagate_outputs_to_edges(g: HGraph, vx: int) -> None:
+    p = g.pmap[vx]
+    out_qints = p.get("output_qints")
+    out_kifs = p.get("output_kifs")
+    out_width = p.get("output_tensor_width_bits")
+
+    if out_kifs:
+        bits = [int(k["bits"]) for k in out_kifs if k is not None and k.get("bits") is not None]
+        element_bw = bits[0] if bits and len(set(bits)) == 1 else None
+        legacy_bw = max(bits) if bits else None
+    else:
+        element_bw = None
+        legacy_bw = None
+
+    for v in g.out_vx(vx):
+        ep = g.pmap[(vx, v)]
+        if out_qints is not None:
+            ep["src_qint"] = out_qints
+        if out_kifs is not None:
+            ep["src_kif"] = out_kifs
+        if element_bw is not None:
+            ep["src_bitwidth_bits"] = float(element_bw)
+            ep["element_bitwidth_bits"] = float(element_bw)
+        if out_width is not None:
+            ep["tensor_width_bits"] = float(out_width)
+            ep["volume_bits_exact"] = float(out_width)
+            ep["volume_bits"] = float(out_width)
+        if legacy_bw is not None:
+            ep["bitwidth"] = float(legacy_bw)
+
+
+def bind_and_propagate(
+    g_sched: HGraph,
+    keras_model,
+    resource_yaml_path: str | Path,
+) -> HGraph:
+    """Phase 1 (variant) — topological BIND + node/edge precision propagation.
+
+    Requires that fold-plan metadata (`parallelism_N/lanes_P/temporal_steps_T`
+    and `reduce_mode`) has already been stamped if you want fold-aware reduce
+    evaluation.
+    """
+    cfg_path = Path(resource_yaml_path).resolve()
+    cfg = yaml.safe_load(cfg_path.read_text())
+    fpga = normalize_fpga(cfg.get("fpga") or {})
+    cfg["fpga"] = fpga
+    library = build_kernel_library(cfg)
+    weights = WeightProvider(keras_model)
+
+    g_sched.pmap["resource_yaml"] = str(cfg_path)
+    g_sched.pmap["target_device"] = fpga.get("device")
+    g_sched.pmap["fpga_config"] = fpga
+
+    next_instance: dict[str, int] = {}
+
+    for vx in _topo_order(g_sched):
+        p = g_sched.pmap[vx]
+        prim = p.get("op")
+        if prim not in _NEEDS_BIND:
+            continue
+
+        _ingest_inputs_from_edges(g_sched, vx)
+
+        candidates = library.get(prim) or []
+        if not candidates:
+            raise ValueError(f"resource YAML has no kernel for primitive {prim!r}")
+
+        chosen = _select_kernel(p, candidates)
+        raw_result = chosen.cost_query(p, weights, fpga)
+        result = _kernel_result.normalize_kernel_result(raw_result, source="closed_form")
+
+        p["kernel_type"] = chosen.name
+        p["kernel_instance"] = next_instance.setdefault(chosen.name, 0)
+        next_instance[chosen.name] += 1
+        _apply_kernel_result(p, result)
+
+        _propagate_outputs_to_edges(g_sched, vx)
+
+    _validate_bind(g_sched)
+    return g_sched
+
+
 # --------------------------------------------------------------------------- #
 # Validation
 # --------------------------------------------------------------------------- #

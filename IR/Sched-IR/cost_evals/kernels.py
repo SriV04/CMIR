@@ -165,6 +165,7 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     axes = op_params.get("axes")
     mode = (op_params.get("mode") or "sum").lower()
     keepdims = bool(op_params.get("keepdims"))
+    reduce_mode = (op_params.get("reduce_mode") or p.get("reduce_mode") or "spatial").lower()
 
     if in_shape is None or in_bw is None or axes is None:
         raise ValueError(
@@ -176,6 +177,15 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     trace_shape = tuple(d for d in in_shape[1:] if d is not None)
     axes_in_trace = tuple(a - 1 for a in axes if a >= 1)
 
+    if reduce_mode in ("temporal_accumulate", "hybrid"):
+        return da4ml_reduce_temporal_cost(
+            p,
+            weights,
+            fpga,
+            parallelism=int(p.get("parallelism_N") or 1),
+            factor=int(p.get("temporal_steps_T") or 1),
+        )
+
     if mode == "sum":
         body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
     elif mode == "max":
@@ -183,8 +193,6 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     elif mode == "min":
         body = lambda x: np.amin(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
     elif mode == "mean":
-        # Mean = sum * (1/N); the * by a constant doesn't add real cost
-        # in da4ml so this is the same as sum for BIND purposes.
         body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
     else:
         raise NotImplementedError(f"reduce mode {mode!r} not supported")
@@ -202,7 +210,7 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
         "mode": mode,
         "axes": axes,
         "reduction_width": op_params.get("reduction_width"),
-        "reduce_mode": op_params.get("reduce_mode") or p.get("reduce_mode") or "spatial",
+        "reduce_mode": reduce_mode,
     }
     return result
 
@@ -355,14 +363,62 @@ def da4ml_reduce_temporal_cost(
         accum_ff = 0
         accum_lat = 0
 
-    return {
+    cost = {
         "lut": spatial_lut + accum_lut,
-        "ff":  spatial_ff + accum_ff,
+        "ff": spatial_ff + accum_ff,
         "dsp": 0,
         "bram": 0,
-        "latency_cycles": spatial_lat + accum_lat,   # L_reduce (pipeline depth only)
-        "ii": T,                                      # = T, matches node.ii
+        "latency_cycles": spatial_lat + accum_lat,  # L_reduce (pipeline depth only)
+        "ii": T,
     }
+
+    # Precision model (fold-aware):
+    # - spatial tree across P_reduce inputs grows integer bits by ceil(log2(P_reduce))
+    # - temporal accumulation across T steps grows integer bits by ceil(log2(T))
+    input_kif = op_params.get("input_kif")
+    if isinstance(input_kif, dict) and all(k in input_kif for k in ("k", "i", "f")):
+        k = bool(input_kif["k"])
+        i = int(input_kif["i"])
+        f = int(input_kif["f"])
+    else:
+        # Fallback: derive from scalar in_bw (assumed integer-only).
+        bw_int = max(int(math.ceil(float(in_bw))), 1)
+        k = True
+        i = max(bw_int - 1, 0)
+        f = 0
+
+    def _grow(bits: int) -> int:
+        return int(math.ceil(math.log2(bits))) if bits and bits > 1 else 0
+
+    i_partial = i + _grow(P_reduce)
+    i_acc = i_partial + _grow(T)
+
+    out_kif = {"k": k, "i": i_acc, "f": f, "bits": int(k) + i_acc + f}
+    partial_kif = {"k": k, "i": i_partial, "f": f, "bits": int(k) + i_partial + f}
+
+    # Total tensor width: one output element per un-reduced channel.
+    output_kifs = [out_kif] * int(n_channels)
+
+    result = _da4ml.empty_kernel_result()
+    result["cost"].update(cost)
+    result["input_kifs"] = [input_kif] if input_kif is not None else [{"k": k, "i": i, "f": f, "bits": int(k) + i + f}]
+    result["output_kifs"] = output_kifs
+    result["input_bitwidths"] = [int(kif.get("bits") or 0) for kif in (result["input_kifs"] or [])]
+    result["output_bitwidths"] = [int(kif.get("bits") or 0) for kif in output_kifs]
+    result["input_tensor_width_bits"] = sum(result["input_bitwidths"]) if result["input_bitwidths"] else None
+    result["output_tensor_width_bits"] = sum(result["output_bitwidths"]) if result["output_bitwidths"] else None
+    result["precision_source"] = "derived"
+    result["kernel_meta"] = {
+        "op": "reduce",
+        "mode": (op_params.get("mode") or "sum").lower(),
+        "reduce_mode": "temporal_accumulate" if P_reduce == 1 else "hybrid",
+        "parallelism": N,
+        "lanes": P_reduce,
+        "temporal_steps": T,
+        "partial_sum_kif": partial_kif,
+        "accumulator_kif": out_kif,
+    }
+    return result
 
 
 def da4ml_activation_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]:

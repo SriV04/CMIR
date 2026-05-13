@@ -21,7 +21,7 @@ _da4ml = _load("_sched_ir_da4ml_debug", HERE / "_da4ml.py")
 
 def main() -> None:
     kernel = np.array([[1.0, -1.0], [0.5, 0.25]], dtype=np.float32)
-    in_qint = _da4ml.qint_from_bw(4)
+    in_qint = _da4ml.qint_from_bw(4)  # 4-bit quantization for the input
 
     dense = _da4ml.solve_dense_result(kernel, in_qint, latency_cutoff=2)
     print("dense.cost", dense["cost"])
