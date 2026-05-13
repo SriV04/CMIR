@@ -58,6 +58,15 @@ vinit_sched = _schema.vinit_sched
 
 BRAM_BITS = 36_864        # 36 Kb per BRAM block
 
+_EDGE_PRECISION_FIELDS = [
+    "qint", "kif",
+    "src_qint", "src_kif", "src_bitwidth_bits",
+    "dst_qint", "dst_kif", "dst_bitwidth_bits",
+    "element_qint", "element_kif", "element_bitwidth_bits",
+    "tensor_width_bits", "volume_bits_exact",
+    "has_quantization_boundary", "needs_cast", "cast_mode",
+]
+
 
 # --------------------------------------------------------------------------- #
 # Buffer sizing
@@ -65,6 +74,13 @@ BRAM_BITS = 36_864        # 36 Kb per BRAM block
 
 def _edge_width_bits(ep: dict) -> int:
     """Total bit-width of data on an edge (prod of non-batch dims × bitwidth)."""
+    exact = ep.get("tensor_width_bits")
+    if exact is None:
+        exact = ep.get("volume_bits_exact")
+    if exact is not None:
+        return int(exact)
+
+    # Legacy fallback: shape × scalar bitwidth.
     shape = ep.get("tensor_shape")
     bw = ep.get("bitwidth")
     if shape is None or bw is None:
@@ -84,6 +100,12 @@ def _choose_buffer_kernel(width_bits: int, depth: int) -> str:
     if total >= BRAM_BITS:
         return "bram_buffer"
     return "register_buffer"
+
+
+def _copy_edge_precision(src: dict, dst: dict) -> None:
+    for key in _EDGE_PRECISION_FIELDS:
+        if key in src:
+            dst[key] = src.get(key)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,6 +192,7 @@ def _insert_buffer(
     if created_ub:
         e_ub = created_ub[0]
         g.pmap[e_ub]["tensor_shape"] = ep.get("tensor_shape")
+        _copy_edge_precision(ep, g.pmap[e_ub])
         g.pmap[e_ub]["bitwidth"]     = ep.get("bitwidth")
         g.pmap[e_ub]["volume_bits"]  = ep.get("volume_bits")
         g.pmap[e_ub]["edge_kind"]    = "data"
@@ -183,6 +206,7 @@ def _insert_buffer(
     if created_bv:
         e_bv = created_bv[0]
         g.pmap[e_bv]["tensor_shape"] = ep.get("tensor_shape")
+        _copy_edge_precision(ep, g.pmap[e_bv])
         g.pmap[e_bv]["bitwidth"]     = ep.get("bitwidth")
         g.pmap[e_bv]["volume_bits"]  = ep.get("volume_bits")
         g.pmap[e_bv]["edge_kind"]    = "data"

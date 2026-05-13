@@ -50,6 +50,7 @@ def _load_path(name: str, path: Path):
 nn_ir_builder = _load_path("nn_ir_builder",     HERE / "NN-IR"    / "builder.py")
 sched_decomp  = _load_path("sched_decomposer",  HERE / "Sched-IR" / "decomposer.py")
 sched_engine  = _load_path("sched_scheduler",   HERE / "Sched-IR" / "binder.py")
+sched_precision = _load_path("sched_precision", HERE / "Sched-IR" / "precision.py")
 sched_folder  = _load_path("sched_folder",      HERE / "Sched-IR" / "folder.py")
 sched_p3      = _load_path("sched_p3",          HERE / "Sched-IR" / "scheduler_p3.py")
 sched_infra   = _load_path("sched_infra",       HERE / "Sched-IR" / "infrastructure.py")
@@ -82,7 +83,7 @@ print(f"[jedi_gnn] nn-ir: {g.num_vx} vertices, {g.num_edges} edges")
 
 
 # --------------------------------------------------------------------------- #
-# Sched-IR pipeline — decompose → bind → fold(K) → schedule → infrastructure
+# Sched-IR pipeline — decompose → bind → propagate_precision → fold(K) → schedule → infrastructure
 # --------------------------------------------------------------------------- #
 
 TARGET_FMAX = 300e6  # 300 MHz — typical VU13P clock
@@ -91,6 +92,7 @@ TARGET_FMAX = 300e6  # 300 MHz — typical VU13P clock
 def _build_bind():
     g_local = sched_decomp.decompose_nn_to_sched(g)
     g_local = sched_engine.bind(g_local, model, RESOURCE_YAML)
+    g_local = sched_precision.propagate_precision(g_local)
     return g_local
 
 

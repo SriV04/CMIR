@@ -101,11 +101,13 @@ def _single_input_precision_kwargs(op_params: dict) -> dict[str, Any]:
     }
 
 
-def _input_qints_for_kernel(op_params: dict, kernel: np.ndarray):
+def _input_qints_for_kernel(op_params: dict, kernel: np.ndarray, *, context: str):
     qints = _da4ml.qints_from_precision_payload(
         op_params.get("input_qint"),
         op_params.get("input_kif"),
         fallback_bw=op_params.get("in_bw"),
+        feature_count=kernel.shape[0],
+        context=context,
     )
 
     if isinstance(qints, list):
@@ -115,11 +117,11 @@ def _input_qints_for_kernel(op_params: dict, kernel: np.ndarray):
             return qints
         if len(qints) == kernel.size:
             raise ValueError(
-                f"dense vertex {op_params.get('layer_name')!r}: got elementwise input precision "
+                f"{context}: got elementwise input precision "
                 f"({len(qints)} qints) where per-input-feature precision ({kernel.shape[0]}) was required"
             )
         raise ValueError(
-            f"dense vertex {op_params.get('layer_name')!r}: expected 1 or {kernel.shape[0]} input qints, got {len(qints)}"
+            f"{context}: expected 1 or {kernel.shape[0]} input qints, got {len(qints)}"
         )
 
     if qints is not None:
@@ -140,7 +142,11 @@ def da4ml_dense_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, 
         )
 
     kernel = _as_2d_kernel(kernel)
-    input_qints = _input_qints_for_kernel(op_params, kernel)
+    input_qints = _input_qints_for_kernel(
+        op_params,
+        kernel,
+        context=f"dense vertex {p.get('nn_layer_name')!r}",
+    )
 
     result = _da4ml.solve_dense_result(
         kernel,

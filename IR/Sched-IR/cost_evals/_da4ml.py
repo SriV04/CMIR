@@ -160,6 +160,92 @@ def kifs_payload_to_dicts(kifs) -> list[dict] | None:
     return [kif_to_dict(kifs)]
 
 
+def _scalar(value):
+    arr = np.asarray(value)
+    if arr.shape == ():
+        return arr.item()
+    if arr.size == 1:
+        return arr.reshape(-1)[0].item()
+    return value
+
+
+def _all_equal(arr: np.ndarray) -> bool:
+    flat = arr.reshape(-1)
+    return bool(flat.size and np.all(arr == flat[0]))
+
+
+def _collapse_precision_record_to_features(
+    record: dict,
+    keys: tuple[str, ...],
+    feature_count: int | None,
+    *,
+    kind: str,
+    context: str,
+) -> list[dict]:
+    arrays = [np.asarray(record[key]) for key in keys]
+    arrays = list(np.broadcast_arrays(*arrays))
+
+    # A broadcast-shaped but globally uniform precision is exact as one
+    # reusable CMVM input precision.
+    if all(_all_equal(arr) for arr in arrays):
+        return [
+            {key: _scalar(arr.reshape(-1)[0]) for key, arr in zip(keys, arrays)}
+        ]
+
+    if feature_count is None:
+        raise ValueError(f"{context}: array-valued {kind} requires feature_count")
+
+    shape = arrays[0].shape
+    if not shape or shape[-1] != feature_count:
+        raise ValueError(
+            f"{context}: array-valued {kind} has shape {shape}, "
+            f"but dense kernel expects last dimension == feature_count={feature_count}"
+        )
+
+    collapsed: list[np.ndarray] = []
+    for key, arr in zip(keys, arrays):
+        flat = arr.reshape(-1, feature_count)
+        if not np.all(flat == flat[0:1, :]):
+            raise ValueError(
+                f"{context}: dense input precision varies across non-feature axes "
+                f"for {kind}.{key}; cannot represent this exactly as CMVM "
+                f"input-feature precision"
+            )
+        collapsed.append(flat[0, :])
+
+    return [
+        {key: _scalar(values[j]) for key, values in zip(keys, collapsed)}
+        for j in range(feature_count)
+    ]
+
+
+def _qints_from_array_dict(qint_payload: dict, feature_count: int | None, context: str):
+    records = _collapse_precision_record_to_features(
+        qint_payload,
+        ("min", "max", "step"),
+        feature_count,
+        kind="qint",
+        context=context,
+    )
+    if len(records) == 1:
+        return qint_from_dict(records[0])
+    return [qint_from_dict(record) for record in records]
+
+
+def _qints_from_kif_array_dict(kif_payload: dict, feature_count: int | None, context: str):
+    records = _collapse_precision_record_to_features(
+        kif_payload,
+        ("k", "i", "f"),
+        feature_count,
+        kind="kif",
+        context=context,
+    )
+    kifs = [kif_to_dict(record) for record in records]
+    if len(kifs) == 1:
+        return qint_from_kif_dict(kifs[0])
+    return [qint_from_kif_dict(kif) for kif in kifs]
+
+
 def qint_from_dict(obj):
     if obj is None:
         return None
@@ -185,7 +271,14 @@ def _shape_size(shape: tuple[int, ...] | None) -> int | None:
     return int(np.prod(dims)) if dims else 1
 
 
-def qints_from_precision_payload(qint_payload, kif_payload=None, fallback_bw=None, shape=None):
+def qints_from_precision_payload(
+    qint_payload,
+    kif_payload=None,
+    fallback_bw=None,
+    shape=None,
+    feature_count: int | None = None,
+    context: str = "precision payload",
+):
     """Coerce qint/kif/bitwidth payloads into QInterval values.
 
     Priority: explicit qint payload, then kif payload, then scalar bw fallback.
@@ -195,11 +288,20 @@ def qints_from_precision_payload(qint_payload, kif_payload=None, fallback_bw=Non
     if qint_payload is not None:
         # da4ml's `QInterval` is tuple-like (iterable) in some versions, so
         # detect it *before* treating tuples/lists as per-element payloads.
-        if QInterval is not None and isinstance(qint_payload, QInterval):  # type: ignore[arg-type]
-            return qint_payload
+        try:
+            if QInterval is not None and isinstance(qint_payload, QInterval):  # type: ignore[arg-type]
+                return qint_payload
+        except TypeError:
+            pass
         if isinstance(qint_payload, dict):
             qint_keys = {"min", "max", "step"}
             if qint_keys.issubset(qint_payload.keys()):
+                if any(np.asarray(qint_payload[key]).ndim > 0 for key in qint_keys):
+                    return _qints_from_array_dict(
+                        qint_payload,
+                        feature_count=feature_count,
+                        context=context,
+                    )
                 return qint_from_dict(qint_payload)
             raise ValueError("array-valued qint dicts are not supported; flatten before coercion")
         if isinstance(qint_payload, (list, tuple)):
@@ -209,6 +311,16 @@ def qints_from_precision_payload(qint_payload, kif_payload=None, fallback_bw=Non
         return qint_from_dict(qint_payload)
 
     if kif_payload is not None:
+        if isinstance(kif_payload, dict):
+            kif_keys = {"k", "i", "f"}
+            if kif_keys.issubset(kif_payload.keys()) and any(
+                np.asarray(kif_payload[key]).ndim > 0 for key in kif_keys
+            ):
+                return _qints_from_kif_array_dict(
+                    kif_payload,
+                    feature_count=feature_count,
+                    context=context,
+                )
         kifs = kifs_payload_to_dicts(kif_payload)
         if kifs is not None:
             if len(kifs) == 1:
