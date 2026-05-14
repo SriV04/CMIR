@@ -150,6 +150,73 @@ class PrecisionPropagationTests(unittest.TestCase):
         self.assertEqual(g.pmap[(a, add)]["tensor_width_bits"], 4)
         self.assertEqual(g.pmap[(b, add)]["tensor_width_bits"], 3)
 
+    def test_legacy_out_bw_fallback_marks_incomplete_kif(self):
+        g = self._graph()
+        src = g.add_vx()
+        dst = g.add_vx()
+        g.add_edge(src, dst)
+
+        src_p = g.pmap[src]
+        src_p["op"] = "dense"
+        src_p["nn_layer_name"] = "legacy_dense"
+        src_p["cost"] = {"lut": 1, "ff": 1, "dsp": 0, "bram": 0, "latency_cycles": 1, "ii": 1}
+        src_p["op_params"] = {"out_bw": 6}
+        g.pmap[(src, dst)]["tensor_shape"] = (None, 1)
+
+        precision.propagate_precision(g)
+
+        fallback = g.pmap[(src, dst)]["src_kif"][0]
+        self.assertEqual(
+            fallback,
+            {"k": None, "i": None, "f": None, "bits": 6, "source": "legacy_out_bw"},
+        )
+
+    def test_broadcast_equivalent_kifs_do_not_mark_cast(self):
+        g = self._graph()
+        src = g.add_vx()
+        dst = g.add_vx()
+        g.add_edge(src, dst)
+
+        kif = {"k": True, "i": 2, "f": 1, "bits": 4}
+        src_p = g.pmap[src]
+        src_p["op"] = "dense"
+        src_p["nn_layer_name"] = "producer"
+        src_p["cost"] = {"lut": 1, "ff": 1, "dsp": 0, "bram": 0, "latency_cycles": 1, "ii": 1}
+        src_p["output_kifs"] = kif
+        src_p["output_tensor_width_bits"] = 8
+
+        ep = g.pmap[(src, dst)]
+        ep["tensor_shape"] = (None, 2)
+        ep["dst_kif"] = [kif, kif]
+
+        precision.propagate_precision(g)
+
+        self.assertFalse(ep["needs_cast"])
+        self.assertFalse(ep["has_quantization_boundary"])
+
+    def test_validate_warns_when_kif_list_does_not_match_edge_shape_volume(self):
+        g = self._graph()
+        src = g.add_vx()
+        dst = g.add_vx()
+        g.add_edge(src, dst)
+
+        src_p = g.pmap[src]
+        src_p["op"] = "dense"
+        src_p["nn_layer_name"] = "producer"
+        src_p["cost"] = {"lut": 1, "ff": 1, "dsp": 0, "bram": 0, "latency_cycles": 1, "ii": 1}
+        src_p["output_kifs"] = [
+            {"k": True, "i": 1, "f": 0, "bits": 2},
+            {"k": True, "i": 1, "f": 0, "bits": 2},
+            {"k": True, "i": 1, "f": 0, "bits": 2},
+        ]
+        src_p["output_tensor_width_bits"] = 6
+        g.pmap[(src, dst)]["tensor_shape"] = (None, 2)
+
+        precision.propagate_precision(g)
+
+        warnings = g.pmap["precision_warnings"] or []
+        self.assertTrue(any("3 src_kif entries for tensor volume 2" in msg for msg in warnings))
+
 
 if __name__ == "__main__":
     unittest.main()

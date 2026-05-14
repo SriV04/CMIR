@@ -15,13 +15,20 @@ _INFRA_OPS = ("buffer", "mux")
 
 
 def _kif_bits(kif: dict | None) -> int | None:
-    if not kif:
+    if not kif or not isinstance(kif, dict):
         return None
     bits = kif.get("bits")
     return int(bits) if bits is not None else None
 
 
+def _as_list(value):
+    if value is None:
+        return None
+    return value if isinstance(value, list) else [value]
+
+
 def _total_bits_from_kifs(kifs) -> int | None:
+    kifs = _as_list(kifs)
     if not kifs:
         return None
     bits = [_kif_bits(k) for k in kifs if k is not None]
@@ -31,6 +38,7 @@ def _total_bits_from_kifs(kifs) -> int | None:
 
 
 def _element_bits_from_kifs(kifs) -> int | None:
+    kifs = _as_list(kifs)
     if not kifs:
         return None
     bits = [_kif_bits(k) for k in kifs if k is not None]
@@ -77,7 +85,9 @@ def _producer_output_precision_with_warnings(p: dict, vx: int, warnings: list[st
             msg = f"vertex {vx} ({p.get('nn_layer_name')}) fell back to legacy op_params.out_bw"
             warnings.append(msg)
             bits = int(legacy_bw)
-            prod["kifs"] = [{"bits": bits}]
+            prod["kifs"] = [
+                {"k": None, "i": None, "f": None, "bits": bits, "source": "legacy_out_bw"}
+            ]
             prod["tensor_width_bits"] = bits
             prod["element_bitwidth_bits"] = bits
             prod["source"] = "legacy_out_bw"
@@ -109,11 +119,13 @@ def _write_edge_producer_precision(ep: dict, prod: dict) -> None:
 def _kifs_equal(a, b) -> bool | None:
     if a is None or b is None:
         return None
-    if not isinstance(a, list):
-        a = [a]
-    if not isinstance(b, list):
-        b = [b]
+    a = _as_list(a)
+    b = _as_list(b)
     if len(a) != len(b):
+        if len(a) == 1 and all(item == a[0] for item in b):
+            return True
+        if len(b) == 1 and all(item == b[0] for item in a):
+            return True
         return False
     return a == b
 
@@ -184,6 +196,18 @@ def _successors(g: HGraph, vx: int) -> list[int]:
 
 def _predecessors(g: HGraph, vx: int) -> list[int]:
     return [src for src, dst in g.edges if dst == vx]
+
+
+def _tensor_volume(shape) -> int | None:
+    if not shape:
+        return None
+    dims = [dim for dim in shape if dim is not None]
+    if not dims:
+        return None
+    volume = 1
+    for dim in dims:
+        volume *= int(dim)
+    return volume
 
 
 def _has_producer_precision(p: dict) -> bool:
@@ -268,6 +292,13 @@ def validate_precision(g_sched: HGraph, *, strict: bool = False) -> list[str]:
 
         if ep.get("src_kif") is not None and ep.get("tensor_width_bits") is None:
             warnings.append(f"edge ({u}, {v}) has src_kif but no tensor_width_bits")
+
+        src_kifs = _as_list(ep.get("src_kif"))
+        volume = _tensor_volume(ep.get("tensor_shape"))
+        if src_kifs is not None and volume is not None and len(src_kifs) not in (1, volume):
+            warnings.append(
+                f"edge ({u}, {v}) has {len(src_kifs)} src_kif entries for tensor volume {volume}"
+            )
 
         if ep.get("element_bitwidth_bits") is not None and ep.get("bitwidth") is None:
             warnings.append(f"edge ({u}, {v}) has element_bitwidth_bits but no bitwidth alias")

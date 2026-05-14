@@ -49,6 +49,8 @@ def _load_path(name: str, path: Path):
 nn_ir_builder = _load_path("nn_ir_builder", HERE / "NN-IR" / "builder.py")
 sched_decomp  = _load_path("sched_decomposer", HERE / "Sched-IR" / "decomposer.py")
 sched_engine  = _load_path("sched_scheduler", HERE / "Sched-IR" / "binder.py")
+sched_precision = _load_path("sched_precision", HERE / "Sched-IR" / "precision.py")
+sched_fold_precision = _load_path("sched_fold_precision", HERE / "Sched-IR" / "fold_precision.py")
 sched_folder  = _load_path("sched_folder", HERE / "Sched-IR" / "folder.py")
 sched_p3      = _load_path("sched_p3", HERE / "Sched-IR" / "scheduler_p3.py")
 sched_infra   = _load_path("sched_infra", HERE / "Sched-IR" / "infrastructure.py")
@@ -124,10 +126,12 @@ FOLD_FACTORS = [1, 2, 4, 8]
 
 
 def build_scheduled(K: int) -> HGraph:
-    """Decompose → Fold-plan(K) → Bind+Propagate → Timing → Schedule → Steady_state → Insert_buffers."""
+    """Decompose → Fold-plan(K) → Bind → Precision → Fold-precision → Timing → Schedule → Steady_state → Insert_buffers."""
     g = sched_decomp.decompose_nn_to_sched(g_nnir)
     g = sched_folder.stamp_fold_plan(g, factor=K)
-    g = sched_engine.bind_and_propagate(g, model, RESOURCE_YAML)
+    g = sched_engine.bind(g, model, RESOURCE_YAML)
+    g = sched_precision.propagate_precision(g)
+    g = sched_fold_precision.apply_fold_aware_precision(g)
     g = sched_folder.apply_timing_from_costs(g)
     g = sched_p3.schedule(g)
     g = sched_p3.steady_state(g, fmax=TARGET_FMAX)

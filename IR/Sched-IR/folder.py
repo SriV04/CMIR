@@ -35,10 +35,9 @@ Flow:
    migrated.
 4. **Temporalise reductions** that consume the folded axis: their
    ``reduce_mode`` flips from ``'spatial'`` to ``'temporal_accumulate'``
-   (when P = 1) or ``'hybrid'`` (1 < P < N), and their ``cost`` is
-   recomputed via ``da4ml_reduce_temporal_cost``. L is refreshed from the
-   new cost and (T, latency_total, ii) are recomputed so the invariants
-   still hold.
+   (when P = 1) or ``'hybrid'`` (1 < P < N). Fold-aware cost/precision
+   recomputation is handled by ``fold_precision.apply_fold_aware_precision``
+   in the fold-first pipeline.
 5. Vertices outside any fold group get (N=1, P=1, T=1, ii=1,
    latency_total=L).
 6. Populate ``g_sched.pmap['fold_plan']`` with per-group metadata.
@@ -183,7 +182,8 @@ def stamp_fold_plan(
 
     It exists to support a fold-first flow:
 
-        decompose -> stamp_fold_plan -> bind/precision-propagate -> apply_timing -> schedule
+        decompose -> stamp_fold_plan -> bind -> propagate_precision
+        -> apply_fold_aware_precision -> apply_timing -> schedule
     """
     if (factor is None) == (lanes is None):
         raise ValueError("stamp_fold_plan(...) requires exactly one of factor= or lanes=")
@@ -342,7 +342,8 @@ def fold(
     # Back-compat: preserve the old "bind -> fold" call pattern.
     #
     # Newer flows should prefer:
-    #   stamp_fold_plan(...) -> bind_and_propagate(...) -> apply_timing_from_costs(...)
+    #   stamp_fold_plan(...) -> bind(...) -> propagate_precision(...)
+    #   -> apply_fold_aware_precision(...) -> apply_timing_from_costs(...)
     stamp_fold_plan(g_sched, factor=factor, lanes=lanes)
     apply_timing_from_costs(g_sched)
     return g_sched

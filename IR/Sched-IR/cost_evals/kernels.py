@@ -184,7 +184,7 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
     axes_in_trace = tuple(a - 1 for a in axes if a >= 1)
 
     if reduce_mode in ("temporal_accumulate", "hybrid"):
-        return da4ml_reduce_temporal_cost(
+        return da4ml_reduce_folded_result(
             p,
             weights,
             fpga,
@@ -217,6 +217,252 @@ def da4ml_reduce_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str,
         "axes": axes,
         "reduction_width": op_params.get("reduction_width"),
         "reduce_mode": reduce_mode,
+    }
+    return result
+
+
+def _as_list(value):
+    if value is None:
+        return None
+    return value if isinstance(value, list) else [value]
+
+
+def _qint_from_kif(kif: dict) -> dict:
+    k = bool(kif.get("k"))
+    i = int(kif.get("i") or 0)
+    f = int(kif.get("f") or 0)
+    step = 2.0 ** (-f)
+    return {
+        "min": -float(2**i) if k else 0.0,
+        "max": float(2**i) - step,
+        "step": step,
+    }
+
+
+def _kif_from_qint(qint: dict) -> dict:
+    qmin = float(qint["min"])
+    qmax = float(qint["max"])
+    step = float(qint["step"])
+    k = qmin < 0
+    if step <= 0:
+        f = 0
+    else:
+        f = max(int(math.ceil(-math.log2(step))), 0)
+    positive_bound = qmax + step if qmax >= 0 else abs(qmax)
+    bound = max(abs(qmin), positive_bound, 1.0)
+    i = max(int(math.ceil(math.log2(bound))), 0)
+    return {"k": k, "i": i, "f": f, "bits": int(k) + i + f}
+
+
+def _sum_qint(qint: dict, width: int) -> dict:
+    return {
+        "min": float(width) * float(qint["min"]),
+        "max": float(width) * float(qint["max"]),
+        "step": float(qint["step"]),
+    }
+
+
+def _qint_values_from_payload(payload) -> list[dict] | None:
+    values = _as_list(payload)
+    if values is None:
+        return None
+    result = []
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        if {"min", "max", "step"}.issubset(value.keys()):
+            result.append(value)
+    return result or None
+
+
+def _has_array_values(record: dict, keys: tuple[str, ...]) -> bool:
+    return any(np.asarray(record[key]).ndim > 0 for key in keys)
+
+
+def _conservative_array_qint(record: dict) -> dict:
+    return {
+        "min": float(np.min(np.asarray(record["min"], dtype=float))),
+        "max": float(np.max(np.asarray(record["max"], dtype=float))),
+        "step": float(np.min(np.asarray(record["step"], dtype=float))),
+    }
+
+
+def _conservative_array_kif(record: dict) -> dict:
+    k = np.asarray(record["k"])
+    i = np.asarray(record["i"], dtype=float)
+    f = np.asarray(record["f"], dtype=float)
+    step = np.power(2.0, -f)
+    max_val = np.power(2.0, i) - step
+    min_val = np.where(k.astype(bool), -np.power(2.0, i), 0.0)
+    return {
+        "min": float(np.min(min_val)),
+        "max": float(np.max(max_val)),
+        "step": float(np.min(step)),
+    }
+
+
+def _conservative_qint(qints: list[dict]) -> tuple[dict, str | None]:
+    if len(qints) == 1 or all(q == qints[0] for q in qints):
+        return qints[0], None
+    return (
+        {
+            "min": min(float(q["min"]) for q in qints),
+            "max": max(float(q["max"]) for q in qints),
+            "step": min(float(q["step"]) for q in qints),
+        },
+        "used conservative folded-reduce precision for heterogeneous input qints",
+    )
+
+
+def _input_reduce_qint_and_kif(op_params: dict) -> tuple[dict, dict, str | None]:
+    input_qint = op_params.get("input_qint")
+    if isinstance(input_qint, dict) and {"min", "max", "step"}.issubset(input_qint.keys()):
+        if _has_array_values(input_qint, ("min", "max", "step")):
+            qint = _conservative_array_qint(input_qint)
+            return qint, _kif_from_qint(qint), "used conservative folded-reduce precision for array input qint"
+
+    qints = _qint_values_from_payload(input_qint)
+    warning = None
+    if qints:
+        qint, warning = _conservative_qint(qints)
+        return qint, _kif_from_qint(qint), warning
+
+    input_kif = op_params.get("input_kif")
+    if isinstance(input_kif, dict) and {"k", "i", "f"}.issubset(input_kif.keys()):
+        if _has_array_values(input_kif, ("k", "i", "f")):
+            qint = _conservative_array_kif(input_kif)
+            return qint, _kif_from_qint(qint), "used conservative folded-reduce precision for array input kif"
+
+    kifs = [k for k in (_as_list(input_kif) or []) if isinstance(k, dict)]
+    complete = [k for k in kifs if all(k.get(key) is not None for key in ("k", "i", "f"))]
+    if complete:
+        if len(complete) == 1 or all(k == complete[0] for k in complete):
+            kif = dict(complete[0])
+            kif.setdefault("bits", int(bool(kif["k"])) + int(kif["i"]) + int(kif["f"]))
+            return _qint_from_kif(kif), kif, None
+        qints = [_qint_from_kif(kif) for kif in complete]
+        qint, warning = _conservative_qint(qints)
+        return qint, _kif_from_qint(qint), "used conservative folded-reduce precision for heterogeneous input kifs"
+
+    in_bw = op_params.get("in_bw")
+    if in_bw is None:
+        raise ValueError("folded reduce has no input precision")
+    bits = max(int(math.ceil(float(in_bw))), 1)
+    kif = {"k": True, "i": max(bits - 1, 0), "f": 0, "bits": bits, "source": "legacy_in_bw"}
+    return _qint_from_kif(kif), kif, "used legacy in_bw folded-reduce precision"
+
+
+def _output_element_count(in_shape, axes) -> int:
+    full_shape = tuple(d for d in in_shape[1:] if d is not None)
+    axes_in_trace = {a - 1 for a in axes if a >= 1}
+    count = 1
+    for idx, dim in enumerate(full_shape):
+        if idx not in axes_in_trace:
+            count *= int(dim)
+    return count
+
+
+def _spatial_trace_shape(in_shape, axes, p_reduce: int) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    full_shape = tuple(d for d in in_shape[1:] if d is not None)
+    axes_in_trace = tuple(a - 1 for a in axes if a >= 1)
+    spatial_shape = list(full_shape)
+    for axis in axes_in_trace:
+        spatial_shape[axis] = p_reduce
+    return tuple(spatial_shape), axes_in_trace
+
+
+def da4ml_reduce_folded_result(
+    p: dict,
+    weights: WeightProvider,
+    fpga: dict,
+    *,
+    parallelism: int,
+    factor: int,
+) -> dict[str, Any]:
+    """Fold-aware reduction result with explicit partial/accumulator precision."""
+    _ = weights
+    op_params = p.get("op_params") or {}
+    in_shape = op_params.get("in_shape")
+    axes = op_params.get("axes") or []
+    mode = (op_params.get("mode") or "sum").lower()
+    keepdims = bool(op_params.get("keepdims"))
+
+    if mode != "sum":
+        raise NotImplementedError(f"fold-aware reduce mode {mode!r} is not supported")
+    if in_shape is None:
+        raise ValueError(f"reduce vertex {p.get('nn_layer_name')!r}: missing in_shape")
+
+    N = int(parallelism)
+    T = max(int(factor), 1)
+    P_reduce = max(math.ceil(N / T), 1)
+    n_outputs = _output_element_count(in_shape, axes)
+    input_qint, input_kif, precision_warning = _input_reduce_qint_and_kif(op_params)
+
+    partial_qint = _sum_qint(input_qint, P_reduce)
+    accumulator_qint = _sum_qint(input_qint, N)
+    partial_kif = _kif_from_qint(partial_qint)
+    accumulator_kif = _kif_from_qint(accumulator_qint)
+
+    if P_reduce > 1:
+        spatial_shape, axes_in_trace = _spatial_trace_shape(in_shape, axes, P_reduce)
+        body = lambda x: np.sum(x, axis=axes_in_trace, keepdims=keepdims)  # noqa: E731
+        spatial_result = _da4ml.trace_lambda_result(
+            [spatial_shape],
+            body,
+            input_qints=[input_qint],
+            input_kifs=[input_kif],
+            adder_size=int(fpga.get("adder_size", -1)),
+            carry_size=int(fpga.get("carry_size", -1)),
+            latency_cutoff=int(fpga.get("latency_cutoff", -1)),
+        )
+        spatial_cost = spatial_result.get("cost") or {}
+        spatial_lut = int(spatial_cost.get("lut") or 0)
+        spatial_ff = int(spatial_cost.get("ff") or 0)
+        spatial_lat = int(spatial_cost.get("latency_cycles") or 0)
+    else:
+        spatial_lut = 0
+        spatial_ff = 0
+        spatial_lat = 0
+
+    accum_bits = int(accumulator_kif["bits"])
+    accum_lut = n_outputs * accum_bits if T > 1 else 0
+    accum_ff = n_outputs * accum_bits if T > 1 else 0
+    accum_lat = 1 if T > 1 else 0
+    output_qints = [accumulator_qint] * int(n_outputs)
+    output_kifs = [accumulator_kif] * int(n_outputs)
+
+    result = _da4ml.empty_kernel_result()
+    result["cost"].update(
+        {
+            "lut": spatial_lut + accum_lut,
+            "ff": spatial_ff + accum_ff,
+            "dsp": 0,
+            "bram": 0,
+            "latency_cycles": max(spatial_lat + accum_lat, 1),
+            "ii": T,
+        }
+    )
+    result["input_qints"] = [input_qint]
+    result["input_kifs"] = [input_kif]
+    result["output_qints"] = output_qints
+    result["output_kifs"] = output_kifs
+    result["input_bitwidths"] = [int(input_kif.get("bits") or 0)]
+    result["output_bitwidths"] = [int(kif.get("bits") or 0) for kif in output_kifs]
+    result["input_tensor_width_bits"] = sum(result["input_bitwidths"])
+    result["output_tensor_width_bits"] = sum(result["output_bitwidths"])
+    result["precision_source"] = "fold_aware_derived"
+    result["kernel_meta"] = {
+        "op": "reduce",
+        "mode": mode,
+        "reduce_mode": "temporal_accumulate" if P_reduce == 1 else "hybrid",
+        "parallelism": N,
+        "lanes": P_reduce,
+        "temporal_steps": T,
+        "partial_sum_qint": partial_qint,
+        "partial_sum_kif": partial_kif,
+        "accumulator_qint": accumulator_qint,
+        "accumulator_kif": accumulator_kif,
+        "precision_warning": precision_warning,
     }
     return result
 
@@ -527,6 +773,7 @@ def lut_mux_cost(p: dict, weights: WeightProvider, fpga: dict) -> dict[str, Any]
 REGISTRY: dict[str, Callable[..., dict[str, Any]]] = {
     "da4ml_dense_cost":           da4ml_dense_cost,
     "da4ml_reduce_cost":          da4ml_reduce_cost,
+    "da4ml_reduce_folded_result": da4ml_reduce_folded_result,
     "da4ml_reduce_temporal_cost": da4ml_reduce_temporal_cost,
     "da4ml_elementwise_cost":     da4ml_elementwise_cost,
     "da4ml_activation_cost":      da4ml_activation_cost,

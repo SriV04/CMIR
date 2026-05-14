@@ -51,6 +51,7 @@ nn_ir_builder = _load_path("nn_ir_builder",     HERE / "NN-IR"    / "builder.py"
 sched_decomp  = _load_path("sched_decomposer",  HERE / "Sched-IR" / "decomposer.py")
 sched_engine  = _load_path("sched_scheduler",   HERE / "Sched-IR" / "binder.py")
 sched_precision = _load_path("sched_precision", HERE / "Sched-IR" / "precision.py")
+sched_fold_precision = _load_path("sched_fold_precision", HERE / "Sched-IR" / "fold_precision.py")
 sched_folder  = _load_path("sched_folder",      HERE / "Sched-IR" / "folder.py")
 sched_p3      = _load_path("sched_p3",          HERE / "Sched-IR" / "scheduler_p3.py")
 sched_infra   = _load_path("sched_infra",       HERE / "Sched-IR" / "infrastructure.py")
@@ -83,7 +84,8 @@ print(f"[jedi_gnn] nn-ir: {g.num_vx} vertices, {g.num_edges} edges")
 
 
 # --------------------------------------------------------------------------- #
-# Sched-IR pipeline — decompose → bind → propagate_precision → fold(K) → schedule → infrastructure
+# Sched-IR pipeline — decompose → stamp_fold_plan(K) → bind → propagate_precision
+#                     → apply_fold_aware_precision → apply_timing → schedule → infrastructure
 # --------------------------------------------------------------------------- #
 
 TARGET_FMAX = 300e6  # 300 MHz — typical VU13P clock
@@ -96,14 +98,22 @@ def _build_bind():
     return g_local
 
 
-def _build_unscheduled(K: int):
-    g_local = _build_bind()
-    g_local = sched_folder.fold(g_local, factor=K)
+def _build_bound_folded(K: int):
+    g_local = sched_decomp.decompose_nn_to_sched(g)
+    g_local = sched_folder.stamp_fold_plan(g_local, factor=K)
+    g_local = sched_engine.bind(g_local, model, RESOURCE_YAML)
+    g_local = sched_precision.propagate_precision(g_local)
+    g_local = sched_fold_precision.apply_fold_aware_precision(g_local)
+    g_local = sched_folder.apply_timing_from_costs(g_local)
     return g_local
 
 
+def _build_unscheduled(K: int):
+    return _build_bound_folded(K)
+
+
 def _build_sched_p3(K: int):
-    g_local = _build_unscheduled(K)
+    g_local = _build_bound_folded(K)
     g_local = sched_p3.schedule(g_local)
     g_local = sched_p3.steady_state(g_local, fmax=TARGET_FMAX)
     return g_local
